@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:docs.polymarket.com)",
+      "Bash(curl:*)",
+      "Bash(python3:*)",
+      "WebFetch(domain:gamma-api.polymarket.com)",
+      "WebFetch(domain:polymarket.com)",
+      "Bash(pip show:*)",
+      "Bash(ls:*)",
+      "Bash(python -m pytest:*)",
+      "Bash(source:*)"
+    ]
+  }
+}

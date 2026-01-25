@@ -1,0 +1,80 @@
+# Polybot Configuration Example
+# Copy to config.yaml and customize for your setup
+
+# Network configuration
+network:
+  chain_id: 137  # Polygon mainnet
+  rpc_url: "https://polygon-rpc.com"
+  clob_host: "https://clob.polymarket.com"
+
+# Markets to trade
+# Option 1: Auto-discover BTC up/down market (recommended)
+# Option 2: Manually specify token_id and condition_id
+markets:
+  # Auto-discover the current BTC up/down market
+  - auto_discover: true
+    outcome: "YES"       # Trade the YES token (or "NO" for the NO token)
+    interval: "1h"      # Market interval: "15m", "1h", "4h", "1d", "1w", "1M"
+                         # Note: Check Polymarket for currently available intervals
+    description: "BTC Up/Down Auto"
+
+  # Or manually specify a market:
+  # - token_id: "39486168536150536185053230681200208328461156344801983984388832812436408811924"
+  #   condition_id: "0x76333a01cb6187e2d730eec31c0ac2690792becccf7c99b6e2bf1b67acb5cd48"
+  #   description: "BTC Up/Down Manual"
+
+# Avellaneda-Stoikov market making parameters
+avellaneda_stoikov:
+  gamma: 0.1          # Risk aversion (0-1). Higher = wider spreads, faster inventory reduction
+  base_spread_x: 0.01 # Base spread multiplier
+  kappa: null         # Order arrival rate (optional, null to use simplified model)
+
+# Belief state estimation
+belief:
+  window_seconds: 300     # Rolling window for volatility estimation
+  sigma_b_floor: 0.01     # Minimum belief volatility
+  robust_method: "median" # Estimation method: median, mean, ewma, huber
+  jump_z: 3.0             # Z-score threshold for jump detection
+  momentum_z: 2.0         # Z-score threshold for momentum detection
+
+# Order execution parameters
+execution:
+  cancel_cooldown_seconds: 2.0   # Minimum time between cancels
+  reprice_threshold_ticks: 2     # Price ticks before repricing order
+  order_lifetime_seconds: 30.0   # Maximum order age before cancel
+
+# Risk management
+risk:
+  stop_prob_low: 0.02            # Stop trading if price below this
+  stop_prob_high: 0.98           # Stop trading if price above this
+  max_net_frac: 0.20             # Maximum position as fraction of bankroll
+  min_time_to_expiry_seconds: 300 # Stop trading 5 min before expiry
+  gamma_danger:
+    threshold: 0.10              # Distance from 0/1 to increase gamma
+    gamma_multiplier: 2.0        # Gamma multiplier in danger zone
+
+# Crypto lag signal for quote skew
+lag_signal:
+  exchange: "binance"
+  skew_multiplier: 1.0
+  assets:
+    - symbol: "BTC/USDT"
+      weight: 0.5
+      vol_window: 60
+    - symbol: "ETH/USDT"
+      weight: 0.3
+      vol_window: 60
+    - symbol: "XRP/USDT"
+      weight: 0.2
+      vol_window: 60
+
+# Paper trading / dry run mode
+dry_run:
+  enabled: false
+  simulated_fill_rate: 0.5
+  initial_balance: 10000.0
+
+# Database
+database:
+  path: "polybot.db"
+  snapshot_interval_seconds: 60

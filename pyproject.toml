@@ -1,0 +1,62 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "polybot"
+version = "0.1.0"
+description = "Production-grade market-making bot for Polymarket CLOB"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [
+    { name = "Your Name", email = "you@example.com" }
+]
+dependencies = [
+    "py-clob-client>=0.34.0",
+    "web3>=6.14.0",
+    "aiohttp>=3.9.0",
+    "websockets>=12.0",
+    "ccxt>=4.0.0",
+    "numpy>=1.26.0",
+    "scipy>=1.11.0",
+    "pandas>=2.0.0",
+    "aiosqlite>=0.19.0",
+    "pyyaml>=6.0",
+    "pydantic>=2.5.0",
+    "pydantic-settings>=2.1.0",
+    "typer>=0.9.0",
+    "rich>=13.0.0",
+    "structlog>=23.2.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.1.0",
+    "ruff>=0.1.0",
+    "mypy>=1.7.0",
+]
+
+[project.scripts]
+polybot = "src.main_loop.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
