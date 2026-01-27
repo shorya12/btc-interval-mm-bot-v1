@@ -659,29 +659,34 @@ class TradingLoop:
             break
 
         # Get position info from Data API (source of truth)
+        # Only show positions for ACTIVE markets (not old resolved ones)
         position_size = 0.0
         position_value = 0.0
         unrealized_pnl = 0.0
         total_initial_value = 0.0
         avg_entry = 0.0
 
-        # Use Data API positions for accurate tracking
+        # Get set of active market token IDs
+        active_token_ids = {m.token_id for m in self.active_markets}
+
+        # Use Data API positions for accurate tracking - filter to active markets only
         if self._data_api_positions:
-            # Sum up all positions (handles multiple markets correctly)
             for pos in self._data_api_positions:
+                token_id = pos.get("token_id", "")
+
+                # Only include positions for active markets (skip old resolved positions)
+                if token_id not in active_token_ids:
+                    continue
+
+                # Skip resolved positions (winning or losing)
+                if pos.get("is_resolved_winning") or pos.get("is_resolved_losing"):
+                    continue
+
                 position_size += pos.get("size", 0)
                 position_value += pos.get("current_value", 0)
                 unrealized_pnl += pos.get("unrealized_pnl", 0)
                 total_initial_value += pos.get("initial_value", 0)
-
-            # Get avg entry from first active market position for display
-            for market in self.active_markets:
-                for pos in self._data_api_positions:
-                    if pos.get("token_id") == market.token_id:
-                        avg_entry = pos.get("avg_price", 0)
-                        break
-                if avg_entry > 0:
-                    break
+                avg_entry = pos.get("avg_price", 0)
         
         # Get open orders count
         open_orders_count = 0
@@ -1083,6 +1088,9 @@ class TradingLoop:
                 # This fixes the issue where fill tracking misses most trades due to pagination
                 for data_pos in self._data_api_positions:
                     if data_pos.get("token_id") == token_id:
+                        # Skip resolved positions
+                        if data_pos.get("is_resolved_winning") or data_pos.get("is_resolved_losing"):
+                            continue
                         position_size = data_pos.get("size", 0)
                         position_pnl = data_pos.get("unrealized_pnl", 0)
                         break

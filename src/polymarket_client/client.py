@@ -528,7 +528,14 @@ class PolymarketClient:
                 if since and created_at < since:
                     continue
 
-                side = OrderSide.BUY if raw.get("side") == "BUY" else OrderSide.SELL
+                # The API "side" field is the TAKER's side, not ours (the maker)
+                # If taker side is SELL, they sold to us → we BOUGHT
+                # If taker side is BUY, they bought from us → we SOLD
+                raw_side = raw.get("side", "")
+                if raw_side == "SELL":
+                    side = OrderSide.BUY  # Someone sold to us, we bought
+                else:
+                    side = OrderSide.SELL  # Someone bought from us, we sold
                 fill = Fill(
                     id=raw.get("id", ""),
                     order_id=raw.get("maker_order_id", ""),
@@ -712,9 +719,13 @@ class PolymarketClient:
                         size = float(pos.get("size", 0))
                         if size > 0.01:  # Ignore dust
                             cur_price = float(pos.get("curPrice", 0.5))
-                            avg_price = float(pos.get("avgPrice", cur_price))
+                            # avgPrice may be 0, None, or missing - fall back to curPrice
+                            raw_avg = pos.get("avgPrice")
+                            avg_price = float(raw_avg) if raw_avg and float(raw_avg) > 0 else cur_price
                             current_value = float(pos.get("currentValue", size * cur_price))
-                            initial_value = float(pos.get("initialValue", size * avg_price))
+                            # initialValue may also be wrong if avgPrice is wrong
+                            raw_initial = pos.get("initialValue")
+                            initial_value = float(raw_initial) if raw_initial and float(raw_initial) > 0 else size * avg_price
 
                             positions.append({
                                 "token_id": pos.get("asset", ""),
