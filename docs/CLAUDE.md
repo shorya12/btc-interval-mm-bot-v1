@@ -37,6 +37,9 @@ scripts/
 ├── close_all_positions.py  # Fetch positions, sell active, show redemption info
 ├── approve_allowances.py   # On-chain token approvals
 └── allowances_example.py   # Example allowance sync
+
+Key modules:
+- polymarket_client/positions.py  # Shared position close logic (used by bot and script)
 ```
 
 ## CLI Commands
@@ -96,19 +99,21 @@ markets:
 
 ## Known Issues / Bugs
 1. ~~**Order size hardcoded**~~ - ✅ FIXED: Dynamic sizing with min $1 value
-2. **No position close logic** - When stop triggers, `close_position=True` but no actual close orders placed
+2. ~~**No position close logic**~~ - ✅ FIXED: Uses `close_all_positions()` from Data API at expiry
 3. ~~**Market refresh clears state**~~ - ✅ FIXED: Managers cleared on refresh, invalid orderbook detection triggers refresh
 4. **Resolved positions** - Winning positions must be redeemed on Polymarket website (not via API)
 5. ~~**No sell orders placed**~~ - ✅ FIXED: Fill timestamp parsing was broken (Unix timestamp vs ISO format)
 6. ~~**15m fallback instead of 1h**~~ - ✅ FIXED: Market discovery no longer falls back to different intervals
+7. **PnL tracking may be inaccurate** - PositionTracker doesn't persist between sessions; investigation needed
 
 ## TODOs (Priority Order)
 1. ~~**Add order sizing**~~ - ✅ DONE: Dynamic sizing based on price with min $1 value
-2. **Implement position close** - Market order to flatten when stop triggered
+2. ~~**Implement position close**~~ - ✅ DONE: Uses `close_all_positions()` at market expiry
 3. **Add WebSocket support** - Real-time order book instead of polling
 4. ~~**Live testing**~~ - ✅ DONE: Tested with real orders on live markets
 5. **PNL snapshots** - Periodic snapshots not yet triggered in main loop
 6. ~~**Cleanup old managers**~~ - ✅ DONE: Cleared on market refresh
+7. **Investigate PnL tracking** - Position tracker may not track correctly across sessions
 
 ## Test Coverage
 **Completed:**
@@ -142,7 +147,21 @@ POLYBOT_API_PASSPHRASE=<optional>
 
 ## Recent Changes
 
-### USDC Balance & Exposure Limits (Latest)
+### Position Close at Expiry (Latest)
+- **Implemented automatic position closing** when `time_to_expiry` stop triggers:
+  - New `src/polymarket_client/positions.py` module with shared logic
+  - `get_positions_from_data_api()` - Fetches actual positions from Polymarket Data API
+  - `close_all_positions(client)` - Cancels orders, fetches positions, sells all at best bid
+  - Bot now uses this proven logic (same as `close_all_positions.py` script) at market expiry
+  - Fixes "not enough balance/allowance" errors when selling positions
+- **How it works**:
+  1. When `time_to_expiry <= 300 seconds` (5 min), stop triggers
+  2. Bot calls `close_all_positions(self.client._client)`
+  3. Function cancels all orders, fetches real positions from Data API
+  4. Places sell orders at best bid for all active positions
+  5. Market refresh is forced to move to next market
+
+### USDC Balance & Exposure Limits
 - **Added real USDC balance checking** (`src/polymarket_client/client.py`):
   - Fetches actual on-chain USDC balance before trading
   - Tries multiple methods: Gamma API, CLOB API, on-chain RPC

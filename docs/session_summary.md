@@ -44,6 +44,9 @@ scripts/
 ├── close_all_positions.py  # Fetch and close all positions
 ├── approve_allowances.py   # On-chain approvals
 └── allowances_example.py   # Example for allowance sync
+
+Key shared modules:
+- polymarket_client/positions.py  # Position close logic (used by bot + script)
 ```
 
 ### 6. Position & Exposure Tracking
@@ -117,17 +120,19 @@ lag_signal:
 ## Known Issues
 1. ~~Live trading untested~~ - ✅ FIXED: Tested with real orders
 2. ~~Order size hardcoded~~ - ✅ FIXED: Dynamic sizing with min $1 value
-3. No position close logic - Stop triggers but no close orders
+3. ~~No position close logic~~ - ✅ FIXED: Uses `close_all_positions()` from Data API at expiry
 4. ~~Market refresh clears state~~ - ✅ FIXED: Managers cleared, invalid orderbook detection
 5. Resolved positions need manual redemption on Polymarket website
+6. PnL tracking may be inaccurate across sessions - needs investigation
 
 ## TODOs (Priority Order)
 1. ~~Add configurable order sizing~~ - ✅ DONE
-2. Implement position close logic
+2. ~~Implement position close logic~~ - ✅ DONE: Uses `close_all_positions()` at expiry
 3. Add WebSocket support for real-time order books
 4. ~~Live testing with small amounts~~ - ✅ DONE
 5. PNL snapshots implementation
 6. ~~Cleanup old managers on market refresh~~ - ✅ DONE
+7. Investigate PnL tracking accuracy across sessions
 
 ## Environment Variables
 ```

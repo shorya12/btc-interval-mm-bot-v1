@@ -14,7 +14,7 @@ from src.belief_state import BeliefManager
 from src.quoting import QuoteCalculator, QuoteContext
 from src.lag_signal import PriceFeed, LagModel, SkewComputer, AssetConfig
 from src.risk import RiskManager, PositionTracker
-from src.polymarket_client import PolymarketClient, OrderBookManager, OrderManager, FillTracker, MarketDiscovery, DiscoveredMarket
+from src.polymarket_client import PolymarketClient, OrderBookManager, OrderManager, FillTracker, MarketDiscovery, DiscoveredMarket, close_all_positions
 from src.polymarket_client.types import OrderSide, OrderBook, OrderBookLevel
 from src.common.config import MarketConfig
 from .dry_run import DryRunAdapter
@@ -113,6 +113,11 @@ class TradingLoop:
         self._balance_check_interval = 30  # Check balance every 30 seconds
         self._usdc_balance: float = 0.0
         self._min_balance_to_trade = self.config.risk.min_balance_to_trade
+
+        # Data API position tracking (source of truth for actual positions)
+        self._last_position_sync: datetime | None = None
+        self._position_sync_interval = 5  # Sync positions every 5 seconds
+        self._data_api_positions: list[dict] = []  # Positions from Data API
 
     async def start(self) -> None:
         """Initialize all components and start trading."""
@@ -518,6 +523,8 @@ class TradingLoop:
             # Sync fills for live mode (every tick to update positions)
             if not self.dry_run:
                 await self._sync_fills()
+                # Sync positions from Data API (source of truth)
+                await self._sync_positions_from_data_api()
                 # Periodically check balance and stop if too low
                 await self._maybe_refresh_balance()
 
@@ -651,24 +658,30 @@ class TradingLoop:
                 current_price = ob_manager.latest_snapshot.mid_price or 0.0
             break
 
-        # Get position info
+        # Get position info from Data API (source of truth)
         position_size = 0.0
         position_value = 0.0
         unrealized_pnl = 0.0
-        realized_pnl = 0.0
+        total_initial_value = 0.0
         avg_entry = 0.0
-        
-        if self.position_tracker:
+
+        # Use Data API positions for accurate tracking
+        if self._data_api_positions:
+            # Sum up all positions (handles multiple markets correctly)
+            for pos in self._data_api_positions:
+                position_size += pos.get("size", 0)
+                position_value += pos.get("current_value", 0)
+                unrealized_pnl += pos.get("unrealized_pnl", 0)
+                total_initial_value += pos.get("initial_value", 0)
+
+            # Get avg entry from first active market position for display
             for market in self.active_markets:
-                pos = self.position_tracker.get_position(market.token_id)
-                if pos.size != 0:
-                    position_size = pos.size
-                    avg_entry = pos.avg_entry_price or 0.0
-                    realized_pnl = pos.realized_pnl
-                    if current_price > 0 and avg_entry > 0:
-                        position_value = position_size * current_price
-                        unrealized_pnl = position_size * (current_price - avg_entry)
-                break
+                for pos in self._data_api_positions:
+                    if pos.get("token_id") == market.token_id:
+                        avg_entry = pos.get("avg_price", 0)
+                        break
+                if avg_entry > 0:
+                    break
         
         # Get open orders count
         open_orders_count = 0
@@ -679,8 +692,8 @@ class TradingLoop:
             for token_orders in status.get("open_orders", {}).values():
                 open_orders_count += token_orders.get("count", 0)
 
-        # Total PnL
-        total_pnl = realized_pnl + unrealized_pnl
+        # Total PnL (unrealized from Data API - this is the actual PnL)
+        total_pnl = unrealized_pnl
         
         # Format PnL with sign
         def fmt_pnl(val: float) -> str:
@@ -836,6 +849,40 @@ class TradingLoop:
                         token_id=token_id[:16] + "...",
                         error=str(e),
                     )
+
+    async def _sync_positions_from_data_api(self) -> None:
+        """
+        Sync positions from Polymarket Data API.
+
+        This is the source of truth for actual positions, as the fill tracking
+        via get_trades() has pagination issues and misses most trades.
+        """
+        if self.dry_run or not isinstance(self.client, PolymarketClient):
+            return
+
+        now = datetime.utcnow()
+
+        # Check if enough time has passed since last sync
+        if self._last_position_sync is not None:
+            elapsed = (now - self._last_position_sync).total_seconds()
+            if elapsed < self._position_sync_interval:
+                return
+
+        self._last_position_sync = now
+
+        try:
+            positions = await self.client.get_positions_from_data_api()
+            self._data_api_positions = positions
+
+            if positions:
+                logger.debug(
+                    "positions_synced_from_data_api",
+                    count=len(positions),
+                    total_value=round(sum(p["current_value"] for p in positions), 2),
+                    total_unrealized_pnl=round(sum(p["unrealized_pnl"] for p in positions), 2),
+                )
+        except Exception as e:
+            logger.warning("data_api_position_sync_error", error=str(e))
 
     async def _maybe_refresh_balance(self) -> None:
         """Periodically refresh USDC balance and update position tracker."""
@@ -1032,21 +1079,24 @@ class TradingLoop:
                 position_pnl = pos.realized_pnl
                 bankroll = self.client.get_balance()
             elif isinstance(self.client, PolymarketClient):
-                # In live mode, get position from fill tracker (synced from exchange)
-                fill_tracker = self.fill_trackers.get(token_id)
-                if fill_tracker:
-                    pos = fill_tracker.get_position(token_id)
-                    position_size = pos.size
-                    position_pnl = pos.realized_pnl
+                # In live mode, use Data API positions as source of truth
+                # This fixes the issue where fill tracking misses most trades due to pagination
+                for data_pos in self._data_api_positions:
+                    if data_pos.get("token_id") == token_id:
+                        position_size = data_pos.get("size", 0)
+                        position_pnl = data_pos.get("unrealized_pnl", 0)
+                        break
 
-                # Also check position_tracker as backup
-                if position_size == 0 and self.position_tracker:
-                    tracker_pos = self.position_tracker.get_position(token_id)
-                    if tracker_pos.size != 0:
-                        position_size = tracker_pos.size
-                        position_pnl = tracker_pos.realized_pnl
+                # Fallback to fill tracker if Data API hasn't synced yet
+                if position_size == 0:
+                    fill_tracker = self.fill_trackers.get(token_id)
+                    if fill_tracker:
+                        pos = fill_tracker.get_position(token_id)
+                        position_size = pos.size
+                        position_pnl = pos.realized_pnl
 
-                # TODO: Get actual bankroll from wallet balance
+                # Use actual USDC balance as bankroll
+                bankroll = self._usdc_balance if self._usdc_balance > 0 else 10000.0
 
             # 4. Compute lag signal skew
             signal_skew = 0.0
@@ -1085,20 +1135,26 @@ class TradingLoop:
                         position=f"{position_size:.2f}" if position_size > 0 else "None",
                     )
                     
-                    # Step 1: Cancel all pending orders
-                    if self.client:
-                        if isinstance(self.client, DryRunAdapter):
-                            await self.client.cancel_all_orders()
-                        elif isinstance(self.client, PolymarketClient):
-                            await self.client.cancel_all_orders()
+                    # Use the proven close_all_positions logic (same as close_all_positions.py script)
+                    if isinstance(self.client, PolymarketClient):
+                        # close_all_positions handles: cancel orders, fetch positions from Data API, sell all
+                        result = await asyncio.to_thread(
+                            close_all_positions,
+                            self.client._client,
+                        )
+                        logger.info(
+                            "expiry_close_complete",
+                            orders_placed=len(result.get("orders_placed", [])),
+                            errors=len(result.get("errors", [])),
+                            total_sold=result.get("total_sold_value", 0),
+                        )
+                    elif isinstance(self.client, DryRunAdapter):
+                        await self.client.cancel_all_orders()
+                    
                     if self.position_tracker:
                         self.position_tracker.record_all_orders_cancelled(token_id)
                     
-                    # Step 2: Sell position if we have one
-                    if position_size > 0 and isinstance(self.client, PolymarketClient):
-                        await self._close_position_at_market(token_id, position_size, snapshot)
-                    
-                    # Step 3: Force market refresh to move to next market
+                    # Force market refresh to move to next market
                     self._last_market_refresh = None
                 
                 return result

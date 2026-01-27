@@ -678,3 +678,67 @@ class PolymarketClient:
     def address(self) -> str:
         """Get wallet address."""
         return self._client.get_address()
+
+    async def get_positions_from_data_api(self) -> list[dict]:
+        """
+        Fetch positions from Polymarket Data API.
+
+        This is the source of truth for actual positions, as it queries
+        the blockchain state directly rather than relying on fill tracking.
+
+        Returns:
+            List of position dicts with token_id, size, avg_price, current_value, etc.
+        """
+        import aiohttp
+
+        url = "https://data-api.polymarket.com/positions"
+        params = {
+            "user": self.address.lower(),
+            "sizeThreshold": 0,  # Get all positions including small ones
+            "limit": 500,
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    if resp.status != 200:
+                        logger.warning("data_api_positions_failed", status=resp.status)
+                        return []
+
+                    data = await resp.json()
+
+                    positions = []
+                    for pos in data:
+                        size = float(pos.get("size", 0))
+                        if size > 0.01:  # Ignore dust
+                            cur_price = float(pos.get("curPrice", 0.5))
+                            avg_price = float(pos.get("avgPrice", cur_price))
+                            current_value = float(pos.get("currentValue", size * cur_price))
+                            initial_value = float(pos.get("initialValue", size * avg_price))
+
+                            positions.append({
+                                "token_id": pos.get("asset", ""),
+                                "condition_id": pos.get("conditionId", ""),
+                                "size": size,
+                                "avg_price": avg_price,
+                                "cur_price": cur_price,
+                                "current_value": current_value,
+                                "initial_value": initial_value,
+                                "unrealized_pnl": current_value - initial_value,
+                                "title": pos.get("title", "unknown"),
+                                "outcome": pos.get("outcome", "unknown"),
+                                "neg_risk": pos.get("negativeRisk", False),
+                                "is_resolved_winning": cur_price >= 0.99,
+                                "is_resolved_losing": cur_price <= 0.01,
+                            })
+
+                    logger.debug(
+                        "data_api_positions_fetched",
+                        count=len(positions),
+                        total_value=round(sum(p["current_value"] for p in positions), 2),
+                    )
+                    return positions
+
+        except Exception as e:
+            logger.warning("data_api_positions_error", error=str(e))
+            return []

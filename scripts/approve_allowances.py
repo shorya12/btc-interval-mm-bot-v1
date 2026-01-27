@@ -51,10 +51,14 @@ async def main() -> None:
     print("\nChecking current approvals...")
     status = await manager.check_approvals()
 
-    print(f"  USDC.e approved: {status.usdc_approved}")
-    print(f"  USDC.e allowance: {status.usdc_allowance / 1e6:.2f} USDC")
-    print(f"  CTF approved: {status.ctf_approved}")
-    print(f"  Neg Risk CTF approved: {status.neg_risk_ctf_approved}")
+    print("  USDC approvals:")
+    print(f"    Exchange: {status.usdc_exchange_approved}")
+    print(f"    NegRisk Exchange: {status.usdc_neg_risk_exchange_approved}")
+    print(f"    NegRisk Adapter: {status.usdc_neg_risk_adapter_approved}")
+    print("  CTF approvals:")
+    print(f"    Exchange: {status.ctf_exchange_approved}")
+    print(f"    NegRisk Exchange: {status.ctf_neg_risk_exchange_approved}")
+    print(f"    NegRisk Adapter: {status.ctf_neg_risk_adapter_approved}")
 
     if status.all_approved:
         print("\nAll required approvals are already set!")
