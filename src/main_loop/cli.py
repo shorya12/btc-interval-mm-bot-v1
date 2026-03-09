@@ -394,6 +394,174 @@ def events(
     asyncio.run(show_events())
 
 
+@app.command()
+def backfill(
+    symbol: str = typer.Option(
+        "BTC/USDT",
+        "--symbol",
+        "-s",
+        help="Trading pair to backfill, e.g. BTC/USDT",
+    ),
+    start_date: str = typer.Option(
+        ...,
+        "--start-date",
+        help="Start date (YYYY-MM-DD)",
+    ),
+    end_date: str = typer.Option(
+        ...,
+        "--end-date",
+        help="End date (YYYY-MM-DD)",
+    ),
+    timeframe: str = typer.Option(
+        "1h",
+        "--timeframe",
+        "-t",
+        help="Candle interval: 1m, 5m, 15m, 1h, 4h, 1d",
+    ),
+    config: Path = typer.Option(
+        "config.yaml",
+        "--config",
+        "-c",
+        help="Path to configuration file",
+    ),
+) -> None:
+    """Backfill OHLCV candle data from Binance."""
+    setup_logging(level="INFO")
+
+    try:
+        cfg = load_config(config)
+    except Exception as e:
+        console.print(f"[red]Failed to load config: {e}[/red]")
+        raise typer.Exit(1)
+
+    try:
+        start = datetime.fromisoformat(start_date)
+        end = datetime.fromisoformat(end_date)
+    except ValueError as e:
+        console.print(f"[red]Invalid date format: {e}[/red]")
+        raise typer.Exit(1)
+
+    async def do_backfill() -> None:
+        from src.data_pipeline.binance_fetcher import backfill as _backfill
+        from src.data_pipeline.gap_detector import detect_gaps, flag_gaps
+        from src.data_pipeline.binance_fetcher import TIMEFRAME_SECONDS
+
+        db = Database(cfg.database.path)
+        await db.connect()
+        repo = Repository(db)
+
+        console.print(f"[yellow]Backfilling {symbol} {timeframe} from {start_date} to {end_date}...[/yellow]")
+
+        try:
+            total = await _backfill(symbol, start, end, timeframe=timeframe, repository=repo)
+            console.print(f"[green]Backfill complete: {total} candles written[/green]")
+
+            # Run gap detection
+            tf_secs = TIMEFRAME_SECONDS.get(timeframe, 3600)
+            prices = await repo.get_recent_crypto_prices(symbol, limit=total + 100)
+            prices_sorted = sorted(prices, key=lambda p: p.timestamp)
+            gaps = detect_gaps(prices_sorted, tf_secs)
+
+            if gaps:
+                console.print(f"[yellow]Detected {len(gaps)} gaps — flagging in EventLog[/yellow]")
+                await flag_gaps(gaps, repo)
+            else:
+                console.print("[green]No gaps detected[/green]")
+
+        except Exception as exc:
+            console.print(f"[red]Backfill failed: {exc}[/red]")
+            raise typer.Exit(1)
+        finally:
+            await db.close()
+
+    from datetime import datetime
+    asyncio.run(do_backfill())
+
+
+@app.command()
+def train(
+    config: Path = typer.Option(
+        "config.yaml",
+        "--config",
+        "-c",
+        help="Path to configuration file",
+    ),
+    symbol: str = typer.Option(
+        "BTC/USDT",
+        "--symbol",
+        "-s",
+        help="Symbol to train on",
+    ),
+    output: str = typer.Option(
+        "models/btc_prob_model.pkl",
+        "--output",
+        "-o",
+        help="Path to save trained model",
+    ),
+) -> None:
+    """Train the BTC probability model with walk-forward validation."""
+    setup_logging(level="INFO")
+
+    try:
+        cfg = load_config(config)
+    except Exception as e:
+        console.print(f"[red]Failed to load config: {e}[/red]")
+        raise typer.Exit(1)
+
+    async def do_train() -> None:
+        import pandas as pd
+        from src.probability_model.xgboost_model import XGBoostModel
+        from src.probability_model.trainer import WalkForwardTrainer
+        from src.probability_model.evaluator import print_eval_summary
+
+        db = Database(cfg.database.path)
+        await db.connect()
+        repo = Repository(db)
+
+        # Load all stored candles for the symbol
+        prices = await repo.get_recent_crypto_prices(symbol, limit=500000)
+        if len(prices) < 100:
+            console.print(f"[red]Not enough data: {len(prices)} candles (need at least 100)[/red]")
+            raise typer.Exit(1)
+
+        prices_sorted = sorted(prices, key=lambda p: p.timestamp)
+
+        # Build DataFrame from CryptoPrice records
+        rows = []
+        for p in prices_sorted:
+            meta = p.metadata or {}
+            rows.append({
+                "timestamp": p.timestamp,
+                "open": meta.get("open", p.price),
+                "high": meta.get("high", p.price),
+                "low": meta.get("low", p.price),
+                "close": p.price,
+                "volume": p.volume_24h or 0.0,
+            })
+        df = pd.DataFrame(rows).set_index("timestamp")
+
+        console.print(f"[yellow]Training on {len(df)} candles from {df.index[0]} to {df.index[-1]}[/yellow]")
+
+        trainer = WalkForwardTrainer(model_class=XGBoostModel, config=cfg.belief)
+        fold_results = trainer.run(df)
+
+        console.print(f"\n[green]Walk-forward complete: {len(fold_results)} folds[/green]")
+        for i, result in enumerate(fold_results):
+            console.print(f"\n[cyan]Fold {i + 1}[/cyan]")
+            print_eval_summary(result.eval_result)
+
+        # Save last fold's model as the production model
+        if fold_results:
+            import os
+            os.makedirs(os.path.dirname(output) if os.path.dirname(output) else ".", exist_ok=True)
+            fold_results[-1].model.save(output)
+            console.print(f"\n[green]Model saved to {output}[/green]")
+
+        await db.close()
+
+    asyncio.run(do_train())
+
+
 def main() -> None:
     """Entry point."""
     app()

@@ -57,6 +57,14 @@ class BeliefConfig(BaseModel):
     jump_z: float = Field(default=3.0, ge=1.0, description="Z-score threshold for jump detection")
     momentum_z: float = Field(default=2.0, ge=1.0, description="Z-score threshold for momentum")
 
+    # ML probability model settings
+    model_type: str = Field(default="xgboost", description="Model type: xgboost or transformer")
+    model_path: str = Field(default="models/btc_prob_model.pkl", description="Path to trained model file")
+    retrain_interval_days: int = Field(default=7, ge=1, description="Days between scheduled retrains")
+    bss_retrain_threshold: float = Field(default=0.0, description="BSS below this triggers retrain")
+    bss_window_days: int = Field(default=14, ge=1, description="Rolling window for live BSS computation")
+    vol_regime_ratio_threshold: float = Field(default=2.0, ge=0.1, description="vol_7d/vol_30d above this = low_confidence")
+
     @field_validator("robust_method")
     @classmethod
     def validate_robust_method(cls, v: str) -> str:

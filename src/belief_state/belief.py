@@ -3,7 +3,7 @@
 from dataclasses import dataclass, field
 from datetime import datetime
 from collections import deque
-from typing import Literal
+from typing import Any, Literal
 import math
 import statistics
 
@@ -283,3 +283,94 @@ class BeliefManager:
         if n is not None:
             returns = returns[-n:]
         return returns
+
+    def estimate_fair_value(
+        self,
+        spot: float,
+        strike: float,
+        candles: Any,  # pd.DataFrame or None
+        time_remaining_frac: float,
+        model_adapter: Any | None = None,
+        sigma_realized: float | None = None,
+    ) -> dict[str, Any]:
+        """
+        Estimate fair-value probability P(close > strike at interval end).
+
+        When a ModelAdapter is provided and ready, delegates to the ML model.
+        Falls back to the rolling-window mid-price estimate otherwise.
+
+        Args:
+            spot: Current BTC spot price
+            strike: Market strike (threshold)
+            candles: OHLCV DataFrame (required for ML model features)
+            time_remaining_frac: Fraction of interval remaining [0, 1]
+            model_adapter: Optional ModelAdapter instance
+            sigma_realized: Realized vol override (uses rolling estimate if None)
+
+        Returns:
+            Dict with keys: probability, confidence, low_confidence (bool), source
+        """
+        import time
+
+        t0 = time.perf_counter()
+
+        # Try ML model path first
+        if model_adapter is not None and model_adapter.is_ready and candles is not None:
+            try:
+                import pandas as pd
+                from src.probability_model.features import compute_ohlcv_features
+
+                if isinstance(candles, pd.DataFrame) and len(candles) >= 30:
+                    ohlcv_feats_df = compute_ohlcv_features(candles)
+                    if not ohlcv_feats_df.empty:
+                        # Use last row as the current feature vector
+                        ohlcv_feats = ohlcv_feats_df.iloc[-1].to_dict()
+
+                        # Use provided or estimated sigma
+                        if sigma_realized is None:
+                            sigma_realized = float(ohlcv_feats.get("realized_vol_60", 0.3) or 0.3)
+
+                        result = model_adapter.predict(
+                            ohlcv_features=ohlcv_feats,
+                            spot=spot,
+                            strike=strike,
+                            sigma_realized=sigma_realized,
+                            time_remaining_frac=time_remaining_frac,
+                        )
+
+                        elapsed_ms = (time.perf_counter() - t0) * 1000
+                        vol_ratio = ohlcv_feats.get("vol_regime_ratio", 1.0)
+                        low_confidence = result.confidence == "low"
+
+                        logger.debug(
+                            "estimate_fair_value_model",
+                            prob=round(result.probability, 4),
+                            confidence=result.confidence,
+                            latency_ms=round(elapsed_ms, 2),
+                        )
+
+                        return {
+                            "probability": result.probability,
+                            "confidence": result.confidence,
+                            "low_confidence": low_confidence,
+                            "source": "ml_model",
+                            "latency_ms": elapsed_ms,
+                            "vol_regime_ratio": vol_ratio,
+                        }
+            except Exception as exc:
+                logger.warning("estimate_fair_value_model_error", error=str(exc))
+
+        # Fallback: rolling-window mid estimate
+        state = self._current_state
+        prob = state.mid_prob if state is not None else 0.5
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+
+        logger.debug("estimate_fair_value_fallback", prob=round(prob, 4))
+
+        return {
+            "probability": prob,
+            "confidence": "medium",
+            "low_confidence": False,
+            "source": "rolling_window",
+            "latency_ms": elapsed_ms,
+        }

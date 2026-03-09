@@ -17,6 +17,7 @@ from src.risk import RiskManager, PositionTracker
 from src.polymarket_client import PolymarketClient, OrderBookManager, OrderManager, FillTracker, MarketDiscovery, DiscoveredMarket, close_all_positions
 from src.polymarket_client.types import OrderSide, OrderBook, OrderBookLevel
 from src.common.config import MarketConfig
+from src.probability_model.model_adapter import ModelAdapter
 from .dry_run import DryRunAdapter
 
 import random
@@ -118,6 +119,12 @@ class TradingLoop:
         self._last_position_sync: datetime | None = None
         self._position_sync_interval = 5  # Sync positions every 5 seconds
         self._data_api_positions: list[dict] = []  # Positions from Data API
+
+        # ML probability model adapter
+        self.model_adapter: ModelAdapter | None = None
+        self._last_retrain_time: datetime | None = None
+        self._retrain_bss_history: list[float] = []  # Rolling BSS for regime detection
+        self._retraining_task: asyncio.Task | None = None
 
     async def start(self) -> None:
         """Initialize all components and start trading."""
@@ -244,6 +251,25 @@ class TradingLoop:
             gamma_danger_threshold=self.config.risk.gamma_danger.threshold,
             gamma_danger_multiplier=self.config.risk.gamma_danger.gamma_multiplier,
         )
+
+        # Initialize ML probability model adapter
+        belief_cfg = self.config.belief
+        self.model_adapter = ModelAdapter(
+            live=not self.dry_run,
+            model_path=belief_cfg.model_path,
+            model_type=belief_cfg.model_type,
+            fixed_prob=0.5,
+            vol_regime_ratio_threshold=belief_cfg.vol_regime_ratio_threshold,
+        )
+        if self.model_adapter.load():
+            logger.info("probability_model_loaded", model_type=belief_cfg.model_type, path=belief_cfg.model_path)
+        else:
+            logger.warning(
+                "probability_model_not_loaded",
+                path=belief_cfg.model_path,
+                note="falling back to rolling-window belief estimator",
+            )
+        self._last_retrain_time = datetime.utcnow()
 
         # Initialize market discovery
         self.market_discovery = MarketDiscovery()
@@ -501,6 +527,9 @@ class TradingLoop:
                                 self.position_tracker.record_all_orders_cancelled()
                     await self._refresh_markets()
 
+                # Check if model retraining is needed
+                await self._check_retrain_schedule()
+
                 # Process each market
                 for market in self.active_markets:
                     await self._tick(market.token_id)
@@ -539,6 +568,116 @@ class TradingLoop:
             elapsed = (datetime.utcnow() - tick_start).total_seconds()
             sleep_time = max(0, 1.0 - elapsed)  # 1 second cadence
             await asyncio.sleep(sleep_time)
+
+    async def _check_retrain_schedule(self) -> None:
+        """
+        Check whether the probability model needs retraining.
+
+        Triggers on:
+        1. Calendar schedule: every `retrain_interval_days` days
+        2. Performance trigger: rolling BSS < threshold for 3 consecutive days
+        """
+        if self.model_adapter is None or self._retraining_task is not None:
+            return
+
+        now = datetime.utcnow()
+        belief_cfg = self.config.belief
+        retrain_interval_days = getattr(belief_cfg, "retrain_interval_days", 7)
+        bss_threshold = getattr(belief_cfg, "bss_retrain_threshold", 0.0)
+        bss_window_days = getattr(belief_cfg, "bss_window_days", 14)
+
+        # Calendar trigger
+        if self._last_retrain_time is not None:
+            days_since = (now - self._last_retrain_time).total_seconds() / 86400
+            if days_since >= retrain_interval_days:
+                logger.info("retrain_calendar_trigger", days_since=round(days_since, 1))
+                await self._trigger_background_retrain(reason="calendar")
+                return
+
+        # Performance trigger: check rolling BSS from stored predictions
+        if self.repo and len(self._retrain_bss_history) >= 3:
+            recent_bss = self._retrain_bss_history[-3:]
+            if all(b < bss_threshold for b in recent_bss):
+                if self.repo:
+                    await self.repo.log_event(
+                        event_type="REGIME_CHANGE_DETECTED",
+                        message="BSS below threshold for 3 consecutive periods — triggering retrain",
+                        severity=EventSeverity.WARNING,
+                        data={"bss_history": recent_bss, "threshold": bss_threshold},
+                    )
+                logger.warning(
+                    "retrain_performance_trigger",
+                    bss_history=recent_bss,
+                    threshold=bss_threshold,
+                )
+                await self._trigger_background_retrain(reason="performance")
+
+    async def _trigger_background_retrain(self, reason: str = "calendar") -> None:
+        """Launch a non-blocking background retrain task."""
+        logger.info("retrain_starting", reason=reason)
+        self._retraining_task = asyncio.create_task(self._background_retrain())
+
+    async def _background_retrain(self) -> None:
+        """
+        Background retraining task.
+
+        Runs in a separate asyncio task so it doesn't block the trading loop.
+        """
+        try:
+            import pandas as pd
+            from src.probability_model.xgboost_model import XGBoostModel
+            from src.probability_model.trainer import WalkForwardTrainer
+
+            if self.repo is None:
+                return
+
+            symbol = "BTC/USDT"
+            prices = await self.repo.get_recent_crypto_prices(symbol, limit=200000)
+            if len(prices) < 100:
+                logger.warning("retrain_insufficient_data", n_candles=len(prices))
+                return
+
+            prices_sorted = sorted(prices, key=lambda p: p.timestamp)
+            rows = []
+            for p in prices_sorted:
+                meta = p.metadata or {}
+                rows.append({
+                    "timestamp": p.timestamp,
+                    "open": meta.get("open", p.price),
+                    "high": meta.get("high", p.price),
+                    "low": meta.get("low", p.price),
+                    "close": p.price,
+                    "volume": p.volume_24h or 0.0,
+                })
+            df = pd.DataFrame(rows).set_index("timestamp")
+
+            trainer = WalkForwardTrainer(model_class=XGBoostModel, config=self.config.belief)
+            fold_results = await asyncio.to_thread(trainer.run, df)
+
+            if fold_results:
+                belief_cfg = self.config.belief
+                model_path = belief_cfg.model_path
+                fold_results[-1].model.save(model_path)
+
+                # Reload model into adapter
+                if self.model_adapter is not None:
+                    self.model_adapter.model_path = model_path
+                    self.model_adapter.load()
+
+                self._last_retrain_time = datetime.utcnow()
+                logger.info("retrain_complete", n_folds=len(fold_results), model_path=model_path)
+
+                if self.repo:
+                    await self.repo.log_event(
+                        event_type="MODEL_RETRAINED",
+                        message=f"Model retrained successfully ({len(fold_results)} folds)",
+                        severity=EventSeverity.INFO,
+                        data={"n_folds": len(fold_results), "model_path": model_path},
+                    )
+        except Exception as exc:
+            logger.error("retrain_failed", error=str(exc))
+        finally:
+            self._retraining_task = None
 
     def _should_refresh_markets(self) -> bool:
         """Check if markets should be refreshed (for auto-discover)."""

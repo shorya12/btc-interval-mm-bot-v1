@@ -36,6 +36,13 @@ belief:
   robust_method: "median" # Estimation method: median, mean, ewma, huber
   jump_z: 3.0             # Z-score threshold for jump detection
   momentum_z: 2.0         # Z-score threshold for momentum detection
+  # ML probability model
+  model_type: "xgboost"                    # or: transformer
+  model_path: "models/btc_prob_model.pkl"  # path to trained model artifact
+  retrain_interval_days: 7                 # calendar retrain cadence
+  bss_retrain_threshold: 0.0               # BSS below this triggers early retrain
+  bss_window_days: 14                      # rolling window for live BSS
+  vol_regime_ratio_threshold: 2.0          # vol_7d/vol_30d above this = low_confidence
 
 # Order execution parameters
 execution:
