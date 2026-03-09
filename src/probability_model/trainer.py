@@ -71,6 +71,26 @@ class WalkForwardTrainer:
             List of FoldResult per fold
         """
         candles = candles.sort_index()
+
+        # Deduplicate: keep last record per timestamp (handles overlapping backfills)
+        n_before_dedup = len(candles)
+        candles = candles[~candles.index.duplicated(keep="last")]
+        n_deduped = n_before_dedup - len(candles)
+        if n_deduped > 0:
+            logger.info("deduplication_applied", n_dropped=n_deduped, n_remaining=len(candles))
+
+        # Filter candles that follow a gap > 2× the timeframe interval (1h = 3600s)
+        timeframe_seconds = 3600
+        if len(candles) > 1:
+            ts_seconds = candles.index.astype(np.int64) // 10**9
+            diffs = np.diff(ts_seconds, prepend=ts_seconds[0])
+            gap_mask = diffs > timeframe_seconds * 2
+            n_before = len(candles)
+            candles = candles[~gap_mask]
+            n_dropped = n_before - len(candles)
+            if n_dropped > 0:
+                logger.info("gap_filter_applied", n_dropped=n_dropped, n_remaining=len(candles))
+
         index = candles.index
 
         train_window = timedelta(days=self.train_months * 30)

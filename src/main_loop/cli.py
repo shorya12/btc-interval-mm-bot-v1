@@ -434,6 +434,8 @@ def backfill(
         console.print(f"[red]Failed to load config: {e}[/red]")
         raise typer.Exit(1)
 
+    from datetime import datetime
+
     try:
         start = datetime.fromisoformat(start_date)
         end = datetime.fromisoformat(end_date)
@@ -474,7 +476,6 @@ def backfill(
         finally:
             await db.close()
 
-    from datetime import datetime
     asyncio.run(do_backfill())
 
 
