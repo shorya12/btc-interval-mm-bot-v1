@@ -2,7 +2,7 @@
 
 from .database import Database
 from .repository import Repository
-from .models import Order, Fill, Position, PnlSnapshot, CryptoPrice, EventLog
+from .models import Order, Fill, Position, PnlSnapshot, CryptoPrice, OptionsSignal, EventLog
 
 __all__ = [
     "Database",
@@ -12,5 +12,6 @@ __all__ = [
     "Position",
     "PnlSnapshot",
     "CryptoPrice",
+    "OptionsSignal",
     "EventLog",
 ]

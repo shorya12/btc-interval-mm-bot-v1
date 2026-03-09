@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 from .base import ProbabilityModel
-from .features import compute_ohlcv_features, compute_strike_features, get_feature_names
+from .features import compute_ohlcv_features, compute_strike_features, compute_options_features, get_feature_names
 from .evaluator import evaluate, EvalResult
 from src.common.logging import get_logger
 
@@ -29,6 +29,8 @@ class FoldResult:
     model: Any  # ProbabilityModel instance
     n_train: int
     n_val: int
+    val_predictions: pd.DataFrame = field(default_factory=pd.DataFrame)
+    # Columns: timestamp, y_true, y_pred_calibrated, fold_index
 
 
 class WalkForwardTrainer:
@@ -60,12 +62,15 @@ class WalkForwardTrainer:
         self.val_weeks = val_weeks
         self.step_weeks = step_weeks
 
-    def run(self, candles: pd.DataFrame) -> list[FoldResult]:
+    def run(self, candles: pd.DataFrame, options_df: pd.DataFrame | None = None) -> list[FoldResult]:
         """
         Execute walk-forward training.
 
         Args:
             candles: OHLCV DataFrame indexed by timestamp (ascending)
+            options_df: Optional DataFrame with columns dvol, put_call_ratio indexed by
+                        timestamp. When provided, options features are merged into OHLCV
+                        features before the fold loop. XGBoost handles NaN natively.
 
         Returns:
             List of FoldResult per fold
@@ -108,10 +113,18 @@ class WalkForwardTrainer:
             logger.error("no_ohlcv_features", n_candles=len(candles))
             return []
 
+        # Merge options features when provided
+        include_options = options_df is not None and not options_df.empty
+        if include_options:
+            opts_feats = compute_options_features(options_df, candles)
+            if not opts_feats.empty:
+                ohlcv_feats = ohlcv_feats.join(opts_feats, how="left")
+                logger.info("options_features_merged", n_options_cols=len(opts_feats.columns))
+
         # Align candles with feature index
         candles_aligned = candles.loc[ohlcv_feats.index]
 
-        feature_names = get_feature_names()
+        feature_names = get_feature_names(include_options=include_options)
         fold_results: list[FoldResult] = []
 
         # First possible training start
@@ -136,9 +149,9 @@ class WalkForwardTrainer:
             cal_mask = (ohlcv_feats.index >= cal_start) & (ohlcv_feats.index < train_end)
             val_mask = (ohlcv_feats.index >= val_start) & (ohlcv_feats.index < val_end)
 
-            X_train, y_train = self._build_dataset(ohlcv_feats[train_mask], candles_aligned[train_mask], feature_names)
-            X_cal, y_cal = self._build_dataset(ohlcv_feats[cal_mask], candles_aligned[cal_mask], feature_names)
-            X_val, y_val = self._build_dataset(ohlcv_feats[val_mask], candles_aligned[val_mask], feature_names)
+            X_train, y_train, _ = self._build_dataset(ohlcv_feats[train_mask], candles_aligned[train_mask], feature_names)
+            X_cal, y_cal, _ = self._build_dataset(ohlcv_feats[cal_mask], candles_aligned[cal_mask], feature_names)
+            X_val, y_val, val_timestamps = self._build_dataset(ohlcv_feats[val_mask], candles_aligned[val_mask], feature_names)
 
             if len(X_train) < 50 or len(X_val) < 10:
                 logger.warning("fold_skipped_insufficient_data", fold=fold_idx, n_train=len(X_train), n_val=len(X_val))
@@ -161,6 +174,14 @@ class WalkForwardTrainer:
 
             eval_result = evaluate(y_val, y_pred, np.zeros(len(y_val)))
 
+            # Build per-sample prediction DataFrame for backtest
+            val_preds_df = pd.DataFrame({
+                "timestamp": val_timestamps,
+                "y_true": y_val,
+                "y_pred_calibrated": y_pred,
+                "fold_index": fold_idx,
+            })
+
             fold_result = FoldResult(
                 fold_index=fold_idx,
                 train_start=pd.Timestamp(train_start),
@@ -171,6 +192,7 @@ class WalkForwardTrainer:
                 model=model,
                 n_train=len(X_train),
                 n_val=len(X_val),
+                val_predictions=val_preds_df,
             )
             fold_results.append(fold_result)
 
@@ -193,27 +215,22 @@ class WalkForwardTrainer:
         features: pd.DataFrame,
         candles: pd.DataFrame,
         feature_names: list[str],
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, pd.Index]:
         """
-        Build (X, y) arrays for a data slice.
+        Build (X, y, timestamps) arrays for a data slice.
 
         Target: 1 if next-period close > current close (synthetic "strike = current close")
         This is a proxy until real Polymarket strike prices are available.
+
+        Returns:
+            (X, y, timestamps) — timestamps are the index of valid rows
         """
         if features.empty or candles.empty:
-            return np.array([]).reshape(0, len(feature_names)), np.array([])
+            return np.array([]).reshape(0, len(feature_names)), np.array([]), pd.Index([])
 
         # Add synthetic strike features using current close as strike
         feat_df = features.copy()
         close = candles["close"].reindex(features.index)
-
-        # Use realized_vol_60 as sigma; fall back to realized_vol_15
-        if "realized_vol_60" in feat_df.columns:
-            sigma = feat_df["realized_vol_60"].fillna(0.3)
-        elif "realized_vol_15" in feat_df.columns:
-            sigma = feat_df["realized_vol_15"].fillna(0.3)
-        else:
-            sigma = pd.Series(0.3, index=feat_df.index)
 
         # Synthetic: predict if next bar close > current close
         # log_moneyness = 0 (spot == strike = current close)
@@ -236,8 +253,9 @@ class WalkForwardTrainer:
         available = [f for f in feature_names if f in feat_df.columns]
         X = feat_df[available].values.astype(np.float32)
         y_arr = y.values.astype(np.int32)
+        timestamps = feat_df.index
 
-        return X, y_arr
+        return X, y_arr, timestamps
 
     def _check_regime_coverage(self, candles: pd.DataFrame) -> None:
         """Warn if training data lacks both bull and bear regimes."""

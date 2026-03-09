@@ -543,8 +543,24 @@ def train(
 
         console.print(f"[yellow]Training on {len(df)} candles from {df.index[0]} to {df.index[-1]}[/yellow]")
 
+        # Load options signals if available
+        opts_df: pd.DataFrame | None = None
+        try:
+            from datetime import datetime as _dt
+            data_start = df.index[0].to_pydatetime() if hasattr(df.index[0], "to_pydatetime") else df.index[0]
+            data_end = df.index[-1].to_pydatetime() if hasattr(df.index[-1], "to_pydatetime") else df.index[-1]
+            opts_signals = await repo.get_options_signals("BTC", data_start, data_end)
+            if opts_signals:
+                opts_rows = [{"timestamp": s.timestamp, "dvol": s.dvol, "put_call_ratio": s.put_call_ratio} for s in opts_signals]
+                opts_df = pd.DataFrame(opts_rows).set_index("timestamp")
+                console.print(f"[yellow]Options signals loaded: {len(opts_df)} rows[/yellow]")
+            else:
+                console.print("[dim]No options signals in DB — training without options features[/dim]")
+        except Exception as exc:
+            console.print(f"[dim]Options signals unavailable ({exc}) — training without[/dim]")
+
         trainer = WalkForwardTrainer(model_class=XGBoostModel, config=cfg.belief)
-        fold_results = trainer.run(df)
+        fold_results = trainer.run(df, options_df=opts_df)
 
         console.print(f"\n[green]Walk-forward complete: {len(fold_results)} folds[/green]")
         for i, result in enumerate(fold_results):
@@ -561,6 +577,356 @@ def train(
         await db.close()
 
     asyncio.run(do_train())
+
+
+@app.command()
+def backtest(
+    config: Path = typer.Option(
+        "config.yaml",
+        "--config",
+        "-c",
+        help="Path to configuration file",
+    ),
+    symbol: str = typer.Option(
+        "BTC/USDT",
+        "--symbol",
+        "-s",
+        help="Symbol to backtest on",
+    ),
+    bet_size: float = typer.Option(
+        100.0,
+        "--bet-size",
+        help="Dollar amount per bet",
+    ),
+    starting_balance: float = typer.Option(
+        10_000.0,
+        "--starting-balance",
+        help="Starting account balance in $",
+    ),
+    thresholds: str = typer.Option(
+        "0.0,0.05,0.10,0.15",
+        "--thresholds",
+        help="Comma-separated edge thresholds (skip bet if |pred-0.5| <= threshold)",
+    ),
+) -> None:
+    """Run flat-bet backtest on walk-forward validation predictions."""
+    setup_logging(level="INFO")
+
+    try:
+        cfg = load_config(config)
+    except Exception as e:
+        console.print(f"[red]Failed to load config: {e}[/red]")
+        raise typer.Exit(1)
+
+    threshold_list = [float(t) for t in thresholds.split(",")]
+
+    async def do_backtest() -> None:
+        import pandas as pd
+        from src.probability_model.xgboost_model import XGBoostModel
+        from src.probability_model.trainer import WalkForwardTrainer
+        from scripts.backtest_flat_bets import simulate_flat_bets, print_fold_summary, print_threshold_summary
+
+        db = Database(cfg.database.path)
+        await db.connect()
+        repo = Repository(db)
+
+        try:
+            prices = await repo.get_recent_crypto_prices(symbol, limit=500_000)
+            if len(prices) < 100:
+                console.print(f"[red]Not enough data: {len(prices)} candles[/red]")
+                raise typer.Exit(1)
+
+            prices_sorted = sorted(prices, key=lambda p: p.timestamp)
+            rows = []
+            for p in prices_sorted:
+                meta = p.metadata or {}
+                rows.append({
+                    "timestamp": p.timestamp,
+                    "open": meta.get("open", p.price),
+                    "high": meta.get("high", p.price),
+                    "low": meta.get("low", p.price),
+                    "close": p.price,
+                    "volume": p.volume_24h or 0.0,
+                })
+            df = pd.DataFrame(rows).set_index("timestamp")
+
+            console.print(f"[yellow]Running walk-forward on {len(df)} candles...[/yellow]")
+            trainer = WalkForwardTrainer(model_class=XGBoostModel, config=cfg.belief)
+            fold_results = trainer.run(df)
+
+            if not fold_results:
+                console.print("[red]No folds produced — insufficient data[/red]")
+                return
+
+            all_preds = pd.concat(
+                [fr.val_predictions for fr in fold_results if not fr.val_predictions.empty],
+                ignore_index=True,
+            )
+            all_preds = (
+                all_preds
+                .sort_values(["timestamp", "fold_index"])
+                .groupby("timestamp")
+                .last()
+                .reset_index()
+            )
+            all_preds = all_preds.sort_values("timestamp").reset_index(drop=True)
+
+            console.print(f"[green]{len(fold_results)} folds, {len(all_preds)} unique val predictions[/green]\n")
+
+            print_fold_summary(fold_results, all_preds)
+            console.print()
+            threshold_results = simulate_flat_bets(
+                all_preds,
+                bet_size=bet_size,
+                starting_balance=starting_balance,
+                thresholds=threshold_list,
+            )
+            print_threshold_summary(threshold_results, starting_balance)
+
+            # Save backtest summary JSON for `polybot summary` command
+            import json as _json
+            import os as _os
+            from datetime import datetime as _dt
+            profitable_folds = sum(
+                1 for fr in fold_results
+                if not fr.val_predictions.empty
+                and (fr.val_predictions["y_true"] == (fr.val_predictions["y_pred_calibrated"] > 0.5).astype(int)).mean() > 0.5
+            )
+            bt_summary = {
+                "run_date": _dt.utcnow().isoformat(),
+                "n_folds": len(fold_results),
+                "val_start": str(all_preds["timestamp"].min()),
+                "val_end": str(all_preds["timestamp"].max()),
+                "n_predictions": len(all_preds),
+                "profitable_folds": profitable_folds,
+                "thresholds": {
+                    str(t): {
+                        "n_bets": s["n_bets"],
+                        "win_rate": round(s["win_rate"], 4),
+                        "profit_factor": round(s["win_rate"] / max(1 - s["win_rate"], 1e-6), 4),
+                        "final_balance": s["final_balance"],
+                        "total_return_pct": round(s["total_return_pct"], 2),
+                        "max_drawdown": round(s["max_drawdown"], 4),
+                        "sharpe": round(s["sharpe"], 4),
+                    }
+                    for t, s in threshold_results.items()
+                },
+            }
+            _os.makedirs("models", exist_ok=True)
+            with open("models/backtest_summary.json", "w") as _f:
+                _json.dump(bt_summary, _f, indent=2)
+            console.print("[dim]Saved to models/backtest_summary.json[/dim]")
+
+        finally:
+            await db.close()
+
+    asyncio.run(do_backtest())
+
+
+@app.command(name="backfill-options")
+def backfill_options(
+    symbol: str = typer.Option(
+        "BTC",
+        "--symbol",
+        "-s",
+        help="Currency to backfill DVOL for (BTC or ETH)",
+    ),
+    start_date: str = typer.Option(
+        ...,
+        "--start-date",
+        help="Start date (YYYY-MM-DD)",
+    ),
+    end_date: str = typer.Option(
+        ...,
+        "--end-date",
+        help="End date (YYYY-MM-DD)",
+    ),
+    config: Path = typer.Option(
+        "config.yaml",
+        "--config",
+        "-c",
+        help="Path to configuration file",
+    ),
+) -> None:
+    """Backfill Deribit DVOL (implied vol index) into options_signals table."""
+    setup_logging(level="INFO")
+
+    try:
+        cfg = load_config(config)
+    except Exception as e:
+        console.print(f"[red]Failed to load config: {e}[/red]")
+        raise typer.Exit(1)
+
+    from datetime import datetime as _datetime
+
+    try:
+        start = _datetime.fromisoformat(start_date)
+        end = _datetime.fromisoformat(end_date)
+    except ValueError as e:
+        console.print(f"[red]Invalid date format: {e}[/red]")
+        raise typer.Exit(1)
+
+    async def do_backfill_options() -> None:
+        from src.data_pipeline.deribit_options_fetcher import backfill_dvol
+
+        db = Database(cfg.database.path)
+        await db.connect()
+        repo = Repository(db)
+
+        console.print(f"[yellow]Backfilling DVOL for {symbol} from {start_date} to {end_date}...[/yellow]")
+
+        try:
+            total = await backfill_dvol(symbol, start, end, repository=repo, currency=symbol)
+            console.print(f"[green]Options backfill complete: {total} rows written[/green]")
+        except Exception as exc:
+            console.print(f"[red]Options backfill failed: {exc}[/red]")
+            raise typer.Exit(1)
+        finally:
+            await db.close()
+
+    asyncio.run(do_backfill_options())
+
+
+@app.command()
+def summary(
+    config: Path = typer.Option(
+        "config.yaml",
+        "--config",
+        "-c",
+        help="Path to configuration file",
+    ),
+) -> None:
+    """Show model status, backtest performance, live DVOL, and paper trading stats."""
+    setup_logging(level="WARNING")
+
+    try:
+        cfg = load_config(config)
+    except Exception as e:
+        console.print(f"[red]Failed to load config: {e}[/red]")
+        raise typer.Exit(1)
+
+    import json
+    import os
+    from datetime import datetime as _dt
+
+    # --- Panel 1: Model Status ---
+    model_path = cfg.belief.model_path
+    model_exists = os.path.exists(model_path)
+    if model_exists:
+        mtime = _dt.fromtimestamp(os.path.getmtime(model_path))
+        model_status = f"[green]Loaded[/green]  {model_path}\nLast modified: {mtime.strftime('%Y-%m-%d %H:%M:%S')}\nModel type: {cfg.belief.model_type}\nVol regime threshold: {cfg.belief.vol_regime_ratio_threshold}\nDirection threshold: {cfg.belief.direction_threshold}"
+    else:
+        model_status = f"[red]Not found[/red]  {model_path}\nRun: [cyan]polybot train[/cyan]"
+    console.print(Panel.fit(model_status, title="Model Status"))
+
+    # --- Panel 2: Backtest Performance ---
+    summary_path = "models/backtest_summary.json"
+    if os.path.exists(summary_path):
+        with open(summary_path) as f:
+            bt = json.load(f)
+
+        bt_table = Table(show_header=True, header_style="bold cyan")
+        bt_table.add_column("Threshold")
+        bt_table.add_column("Bets", justify="right")
+        bt_table.add_column("Win Rate", justify="right")
+        bt_table.add_column("Profit Factor", justify="right")
+        bt_table.add_column("Sharpe", justify="right")
+        bt_table.add_column("Max DD", justify="right")
+
+        for t, s in bt.get("thresholds", {}).items():
+            style = "bold yellow" if t in ("0.1", "0.10", "0.15") else ""
+            bt_table.add_row(
+                t, str(s["n_bets"]),
+                f"{s['win_rate']:.1%}",
+                f"{s['profit_factor']:.3f}",
+                f"{s['sharpe']:.2f}",
+                f"{s['max_drawdown']:.1%}",
+                style=style,
+            )
+
+        bt_info = (
+            f"Run: {bt.get('run_date', 'N/A')[:10]}\n"
+            f"Folds: {bt.get('n_folds', '?')}  Profitable: {bt.get('profitable_folds', '?')}\n"
+            f"Period: {bt.get('val_start', '')[:10]} → {bt.get('val_end', '')[:10]}\n"
+            f"Predictions: {bt.get('n_predictions', '?')}"
+        )
+        console.print(Panel.fit(bt_info, title="Backtest Performance"))
+        console.print(bt_table)
+    else:
+        console.print(Panel.fit(
+            f"[yellow]No backtest summary found at {summary_path}[/yellow]\nRun: [cyan]polybot backtest[/cyan]",
+            title="Backtest Performance",
+        ))
+
+    # --- Panel 3: Live Deribit DVOL ---
+    async def fetch_dvol() -> dict | None:
+        try:
+            import aiohttp
+            url = "https://www.deribit.com/api/v2/public/get_volatility_index_data"
+            params = {"currency": "BTC", "resolution": "3600", "count": 1}
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    data = await resp.json()
+                    rows = data.get("result", {}).get("data", [])
+                    if rows:
+                        ts, open_, high, low, close = rows[-1]
+                        dvol = float(close)
+                        if dvol < 50:
+                            regime, rec = "calm", "HIGH confidence"
+                        elif dvol < 80:
+                            regime, rec = "normal", "MEDIUM confidence"
+                        elif dvol < 100:
+                            regime, rec = "elevated", "LOW confidence"
+                        else:
+                            regime, rec = "extreme", "LOW confidence"
+                        return {"dvol": dvol, "regime": regime, "recommendation": rec}
+        except Exception as exc:
+            return {"error": str(exc)}
+        return None
+
+    dvol_result = asyncio.run(fetch_dvol())
+    if dvol_result and "dvol" in dvol_result:
+        dvol_text = (
+            f"DVOL: [bold]{dvol_result['dvol']:.1f}[/bold]\n"
+            f"Regime: {dvol_result['regime']}\n"
+            f"Model confidence: {dvol_result['recommendation']}"
+        )
+    elif dvol_result and "error" in dvol_result:
+        dvol_text = f"[red]Failed to fetch DVOL: {dvol_result['error']}[/red]"
+    else:
+        dvol_text = "[yellow]No DVOL data returned[/yellow]"
+    console.print(Panel.fit(dvol_text, title="Live Deribit DVOL"))
+
+    # --- Panel 4: Paper Trading P&L ---
+    async def fetch_paper_pnl() -> str:
+        from datetime import date
+        db = Database(cfg.database.path)
+        await db.connect()
+        repo = Repository(db)
+        try:
+            today_start = _dt.combine(date.today(), _dt.min.time())
+            fills = await repo.get_recent_fills(limit=10000)
+            today_fills = [f for f in fills if f.created_at >= today_start]
+
+            gross_profit = sum(f.price * f.size for f in today_fills if f.side.value == "SELL")
+            gross_loss = sum(f.price * f.size for f in today_fills if f.side.value == "BUY")
+            realized_pnl = gross_profit - gross_loss
+            net_pos = sum(f.size if f.side.value == "BUY" else -f.size for f in today_fills)
+
+            return (
+                f"Fills today: {len(today_fills)}\n"
+                f"Gross profit (sells): ${gross_profit:.2f}\n"
+                f"Gross cost (buys): ${gross_loss:.2f}\n"
+                f"Realized P&L: {'[green]' if realized_pnl >= 0 else '[red]'}${realized_pnl:.2f}{'[/green]' if realized_pnl >= 0 else '[/red]'}\n"
+                f"Net position: {net_pos:.2f} shares"
+            )
+        except Exception as exc:
+            return f"[red]DB error: {exc}[/red]"
+        finally:
+            await db.close()
+
+    pnl_text = asyncio.run(fetch_paper_pnl())
+    console.print(Panel.fit(pnl_text, title="Paper Trading P&L (Today)"))
 
 
 def main() -> None:

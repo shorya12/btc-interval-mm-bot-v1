@@ -122,3 +122,16 @@ CREATE TABLE IF NOT EXISTS migrations (
 
 -- Insert initial migration record
 INSERT OR IGNORE INTO migrations (version, name) VALUES (1, 'initial_schema');
+
+-- Options signals: Deribit DVOL + put/call ratio
+CREATE TABLE IF NOT EXISTS options_signals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    symbol TEXT NOT NULL DEFAULT 'BTC',
+    dvol REAL,
+    put_call_ratio REAL,
+    source TEXT NOT NULL DEFAULT 'deribit'
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_options_signals_symbol_timestamp
+    ON options_signals(symbol, timestamp);
+INSERT OR IGNORE INTO migrations (version, name) VALUES (2, 'options_signals_table');

@@ -43,6 +43,7 @@ belief:
   bss_retrain_threshold: 0.0               # BSS below this triggers early retrain
   bss_window_days: 14                      # rolling window for live BSS
   vol_regime_ratio_threshold: 2.0          # vol_7d/vol_30d above this = low_confidence
+  direction_threshold: 0.10               # Use model signal only when |pred - 0.5| > 10%
 
 # Order execution parameters
 execution:

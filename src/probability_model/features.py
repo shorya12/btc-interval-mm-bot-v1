@@ -99,8 +99,57 @@ def build_feature_vector(
     return {**ohlcv_features, **strike_features}
 
 
-def get_feature_names() -> list[str]:
-    """Return the canonical ordered list of feature names."""
+def compute_options_features(
+    options_df: pd.DataFrame,
+    candles_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Compute options-derived features aligned to candle timestamps.
+
+    Args:
+        options_df: DataFrame with columns: dvol, put_call_ratio, indexed by timestamp
+        candles_df: OHLCV candle DataFrame indexed by timestamp (used for realized_vol_60)
+
+    Returns:
+        DataFrame with columns: dvol, dvol_rv_ratio, put_call_ratio, indexed by candle timestamps.
+        Gaps in options data are forward-filled up to 2 periods.
+
+    Notes:
+        - DVOL is in % (e.g. 60.0). realized_vol_60 is decimal (e.g. 0.60).
+          Divide DVOL by 100 before computing ratio.
+        - XGBoost handles NaN natively; no imputation needed for historical P/C gaps.
+    """
+    ohlcv_feats = compute_ohlcv_features(candles_df)
+    if ohlcv_feats.empty or options_df.empty:
+        return pd.DataFrame(index=ohlcv_feats.index)
+
+    # Reindex options onto candle timestamps, forward-fill up to 2 periods
+    opts = options_df.reindex(ohlcv_feats.index).ffill(limit=2)
+
+    result = pd.DataFrame(index=ohlcv_feats.index)
+    result["dvol"] = opts.get("dvol")
+
+    # dvol_rv_ratio: (dvol / 100) / (realized_vol_60 + eps)
+    rv60 = ohlcv_feats.get("realized_vol_60", pd.Series(dtype=float))
+    if not rv60.empty:
+        dvol_decimal = result["dvol"] / 100.0
+        result["dvol_rv_ratio"] = dvol_decimal / (rv60.reindex(result.index) + 1e-10)
+    else:
+        result["dvol_rv_ratio"] = float("nan")
+
+    result["put_call_ratio"] = opts.get("put_call_ratio")
+
+    return result
+
+
+def get_feature_names(include_options: bool = False) -> list[str]:
+    """
+    Return the canonical ordered list of feature names.
+
+    Args:
+        include_options: If True, append options features (dvol, dvol_rv_ratio, put_call_ratio).
+                         Default False preserves backward compatibility.
+    """
     ohlcv_names = []
     for period in [1, 5, 15, 30, 60]:
         ohlcv_names.append(f"log_return_{period}")
@@ -115,7 +164,10 @@ def get_feature_names() -> list[str]:
         "vol_regime_ratio",
     ]
     strike_names = ["log_moneyness", "vol_normalized_dist", "time_remaining"]
-    return ohlcv_names + strike_names
+    names = ohlcv_names + strike_names
+    if include_options:
+        names += ["dvol", "dvol_rv_ratio", "put_call_ratio"]
+    return names
 
 
 def _rsi(prices: pd.Series, period: int = 14) -> pd.Series:

@@ -279,6 +279,40 @@ class CryptoPrice:
 
 
 @dataclass
+class OptionsSignal:
+    """Options market signal record (Deribit DVOL + put/call ratio)."""
+
+    id: int | None
+    timestamp: datetime
+    symbol: str = "BTC"
+    dvol: float | None = None
+    put_call_ratio: float | None = None
+    source: str = "deribit"
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> "OptionsSignal":
+        """Create OptionsSignal from database row."""
+        return cls(
+            id=row.get("id"),
+            timestamp=datetime.fromisoformat(row["timestamp"]) if row.get("timestamp") else datetime.utcnow(),
+            symbol=row.get("symbol", "BTC"),
+            dvol=row.get("dvol"),
+            put_call_ratio=row.get("put_call_ratio"),
+            source=row.get("source", "deribit"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary for database insertion."""
+        return {
+            "timestamp": self.timestamp.isoformat(),
+            "symbol": self.symbol,
+            "dvol": self.dvol,
+            "put_call_ratio": self.put_call_ratio,
+            "source": self.source,
+        }
+
+
+@dataclass
 class EventLog:
     """Event log entry for audit trail."""
 

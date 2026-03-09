@@ -11,6 +11,7 @@ from .models import (
     Position,
     PnlSnapshot,
     CryptoPrice,
+    OptionsSignal,
     EventLog,
     EventSeverity,
     Side,
@@ -397,3 +398,29 @@ class Repository:
         )
         await self.db.commit()
         return cursor.rowcount
+
+    # ==================== Options Signals ====================
+
+    async def create_options_signal(self, signal: OptionsSignal) -> OptionsSignal:
+        """Insert an options signal record (INSERT OR IGNORE for safe re-backfill)."""
+        data = signal.to_dict()
+        columns = ", ".join(data.keys())
+        placeholders = ", ".join(f":{k}" for k in data.keys())
+        sql = f"INSERT OR IGNORE INTO options_signals ({columns}) VALUES ({placeholders})"
+        cursor = await self.db.execute(sql, data)
+        await self.db.commit()
+        signal.id = cursor.lastrowid
+        return signal
+
+    async def get_options_signals(
+        self,
+        symbol: str,
+        start: datetime,
+        end: datetime,
+    ) -> list[OptionsSignal]:
+        """Fetch options signals for a symbol in the given time range."""
+        rows = await self.db.fetch_all(
+            "SELECT * FROM options_signals WHERE symbol = :symbol AND timestamp >= :start AND timestamp < :end ORDER BY timestamp",
+            {"symbol": symbol, "start": start.isoformat(), "end": end.isoformat()},
+        )
+        return [OptionsSignal.from_row(row) for row in rows]

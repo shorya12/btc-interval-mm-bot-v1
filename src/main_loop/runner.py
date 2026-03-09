@@ -126,6 +126,11 @@ class TradingLoop:
         self._retrain_bss_history: list[float] = []  # Rolling BSS for regime detection
         self._retraining_task: asyncio.Task | None = None
 
+        # Candles cache for model inference
+        self._candles_cache: Any = None  # pd.DataFrame | None
+        self._candles_cache_tick: int = 0
+        self._candles_cache_interval: int = 3600  # refresh every ~1h of ticks
+
     async def start(self) -> None:
         """Initialize all components and start trading."""
         logger.info("trading_loop_starting", dry_run=self.dry_run)
@@ -271,6 +276,9 @@ class TradingLoop:
             )
         self._last_retrain_time = datetime.utcnow()
 
+        # Pre-load candles cache for model inference
+        await self._refresh_candles_cache()
+
         # Initialize market discovery
         self.market_discovery = MarketDiscovery()
 
@@ -292,6 +300,32 @@ class TradingLoop:
 
         # Start main loop
         await self._run_loop()
+
+    async def _refresh_candles_cache(self) -> None:
+        """Load recent OHLCV from DB into memory for model inference."""
+        if self.repo is None:
+            return
+        try:
+            import pandas as pd
+            prices = await self.repo.get_recent_crypto_prices("BTC/USDT", limit=10000)
+            if len(prices) < 100:
+                return
+            prices_sorted = sorted(prices, key=lambda p: p.timestamp)
+            rows = []
+            for p in prices_sorted:
+                meta = p.metadata or {}
+                rows.append({
+                    "timestamp": p.timestamp,
+                    "open": meta.get("open", p.price),
+                    "high": meta.get("high", p.price),
+                    "low": meta.get("low", p.price),
+                    "close": p.price,
+                    "volume": p.volume_24h or 0.0,
+                })
+            self._candles_cache = pd.DataFrame(rows).set_index("timestamp")
+            logger.info("candles_cache_refreshed", n=len(self._candles_cache))
+        except Exception as exc:
+            logger.debug("candles_cache_refresh_error", error=str(exc))
 
     async def _sync_clob_allowances(self) -> None:
         """
@@ -529,6 +563,11 @@ class TradingLoop:
 
                 # Check if model retraining is needed
                 await self._check_retrain_schedule()
+
+                # Periodically refresh candles cache for model inference
+                self._candles_cache_tick += 1
+                if self._candles_cache_tick % self._candles_cache_interval == 0:
+                    asyncio.create_task(self._refresh_candles_cache())
 
                 # Process each market
                 for market in self.active_markets:
@@ -1250,6 +1289,40 @@ class TradingLoop:
             if self.skew_computer:
                 skew_signal = self.skew_computer.compute_weighted_skew()
                 signal_skew = skew_signal.total_skew
+
+            # 4b. Model probability signal
+            direction_threshold = getattr(self.config.belief, "direction_threshold", 0.10)
+            if (
+                self.model_adapter is not None
+                and self.model_adapter.is_ready
+                and self._candles_cache is not None
+                and len(self._candles_cache) > 100
+                and snapshot.mid_price is not None
+            ):
+                try:
+                    belief_result = self.belief_managers[token_id].estimate_fair_value(
+                        spot=snapshot.mid_price,
+                        strike=snapshot.mid_price,
+                        candles=self._candles_cache,
+                        time_remaining_frac=1.0,
+                        model_adapter=self.model_adapter,
+                    )
+                    model_prob = belief_result.get("probability", snapshot.mid_price)
+                    model_confidence = belief_result.get("confidence", "low")
+                    prob_delta = model_prob - snapshot.mid_price
+
+                    logger.debug(
+                        "model_signal",
+                        model_prob=round(model_prob, 4),
+                        market_mid=round(snapshot.mid_price, 4),
+                        delta=round(prob_delta, 4),
+                        confidence=model_confidence,
+                    )
+
+                    if abs(prob_delta) > direction_threshold and model_confidence != "low":
+                        signal_skew += prob_delta
+                except Exception as exc:
+                    logger.debug("model_signal_error", error=str(exc))
 
             # 5. Evaluate risk (including time to expiry)
             time_to_expiry = self._get_time_to_expiry(token_id)

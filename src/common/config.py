@@ -64,6 +64,12 @@ class BeliefConfig(BaseModel):
     bss_retrain_threshold: float = Field(default=0.0, description="BSS below this triggers retrain")
     bss_window_days: int = Field(default=14, ge=1, description="Rolling window for live BSS computation")
     vol_regime_ratio_threshold: float = Field(default=2.0, ge=0.1, description="vol_7d/vol_30d above this = low_confidence")
+    direction_threshold: float = Field(
+        default=0.10,
+        ge=0.0,
+        le=0.5,
+        description="Min |model_prob - market_mid| to act on model signal",
+    )
 
     @field_validator("robust_method")
     @classmethod
