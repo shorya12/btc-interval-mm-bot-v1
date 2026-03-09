@@ -65,10 +65,16 @@ class BeliefConfig(BaseModel):
     bss_window_days: int = Field(default=14, ge=1, description="Rolling window for live BSS computation")
     vol_regime_ratio_threshold: float = Field(default=2.0, ge=0.1, description="vol_7d/vol_30d above this = low_confidence")
     direction_threshold: float = Field(
-        default=0.10,
+        default=0.05,
         ge=0.0,
         le=0.5,
-        description="Min |model_prob - market_mid| to act on model signal",
+        description="Min |model_prob - 0.5| to act on model signal",
+    )
+    ml_bet_fraction: float = Field(
+        default=0.10,
+        ge=0.01,
+        le=1.0,
+        description="Fraction of bankroll to stake per ML entry signal",
     )
 
     @field_validator("robust_method")

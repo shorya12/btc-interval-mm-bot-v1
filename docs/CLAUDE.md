@@ -23,15 +23,25 @@
 ## Architecture
 ```
 src/
-├── belief_state/     # Logit transforms, BeliefManager (rolling window estimation)
-├── quoting/          # A-S algorithm, QuoteCalculator with gamma danger zones
-├── lag_signal/       # PriceFeed (ccxt), LagModel (vol, lognormal q), SkewComputer
-├── risk/             # VetoChecker, StopChecker, InventoryManager, RiskManager, PositionTracker
-├── polymarket_client/# PolymarketClient, OrderBook/Order/Fill types, MarketDiscovery
-├── wallet_approval/  # Polygon USDC/CTF approvals
-├── persistence/      # SQLite: orders, fills, positions, pnl_snapshots, events
-├── main_loop/        # TradingLoop, DryRunAdapter, CLI
-└── common/           # Config, logging, errors
+├── belief_state/       # Logit transforms, BeliefManager (rolling window + ML estimate)
+├── quoting/            # A-S algorithm, QuoteCalculator with gamma danger zones
+├── lag_signal/         # PriceFeed (ccxt), LagModel (vol, lognormal q), SkewComputer
+├── risk/               # VetoChecker, StopChecker, InventoryManager, RiskManager, PositionTracker
+├── polymarket_client/  # PolymarketClient, OrderBook/Order/Fill types, MarketDiscovery
+├── wallet_approval/    # Polygon USDC/CTF approvals
+├── persistence/        # SQLite: orders, fills, positions, pnl_snapshots, events
+├── data_pipeline/      # Binance OHLCV backfill, gap detection        ← NEW
+├── probability_model/  # ML probability models (XGBoost → Transformer) ← NEW
+│   ├── base.py         # Abstract ProbabilityModel interface
+│   ├── features.py     # OHLCV feature engineering + strike encoding
+│   ├── xgboost_model.py
+│   ├── transformer_model.py  # Phase 2 (stub — see TODOs)
+│   ├── calibrator.py   # Isotonic regression post-hoc calibration
+│   ├── trainer.py      # Walk-forward training pipeline
+│   ├── evaluator.py    # Brier/BSS/log-loss + reliability diagrams
+│   └── model_adapter.py # Live vs mock inference for dry-run
+├── main_loop/          # TradingLoop, DryRunAdapter, CLI
+└── common/             # Config, logging, errors
 
 scripts/
 ├── close_all_positions.py  # Fetch positions, sell active, show redemption info
@@ -39,7 +49,32 @@ scripts/
 └── allowances_example.py   # Example allowance sync
 
 Key modules:
-- polymarket_client/positions.py  # Shared position close logic (used by bot and script)
+- polymarket_client/positions.py    # Shared position close logic (used by bot and script)
+- probability_model/model_adapter.py # ModelAdapter(live=True/False) wraps real vs mock model
+- belief_state/belief.py            # estimate_fair_value() — ML model with rolling-window fallback
+```
+
+## Active Feature Branch
+
+**Branch:** `feature/probability-model`
+**Worktree:** `.worktrees/probability-model/` (isolated from `main`)
+**Status:** Phases 1–6 implemented, committed. Phase 7 (Transformer) pending.
+
+```bash
+# Work on the feature branch
+cd .worktrees/probability-model
+
+# Run all tests (206 passing, 3 pre-existing failures unrelated to ML work)
+python3 -m pytest tests/ -q
+
+# Backfill historical data (required before training)
+polybot backfill --symbol BTC/USDT --start-date 2024-01-01 --end-date 2024-12-31 --timeframe 1h
+
+# Train the model with walk-forward validation
+polybot train --output models/btc_prob_model.pkl
+
+# Run dry-run with ML model active
+polybot run --dry-run
 ```
 
 ## CLI Commands
@@ -49,6 +84,8 @@ polybot run                    # Live trading
 polybot approve                # Set token approvals
 polybot status                 # Show positions/PNL
 polybot events                 # View event log
+polybot backfill               # Backfill OHLCV from Binance (NEW)
+polybot train                  # Walk-forward train probability model (NEW)
 ```
 
 ## Utility Scripts
@@ -63,6 +100,8 @@ python scripts/approve_allowances.py
 
 ## Config Structure (config.yaml)
 Key sections: `network`, `markets`, `avellaneda_stoikov`, `belief`, `execution`, `risk`, `lag_signal`, `dry_run`, `database`
+
+The `belief` section now includes ML model settings (added in `feature/probability-model`):
 
 **Auto-discovery for BTC markets:**
 ```yaml
@@ -91,6 +130,22 @@ markets:
 - Robust estimation (median/mean/ewma/huber)
 - Jump detection: single-tick z-score > jump_z
 - Momentum detection: average return z-score > momentum_z
+- **NEW** `estimate_fair_value(spot, strike, candles, time_remaining, model_adapter)`:
+  - Delegates to ML model when `ModelAdapter` is loaded and candles available
+  - Falls back to rolling-window mid estimate automatically
+  - Returns `{probability, confidence, low_confidence, source, latency_ms}`
+
+### Probability Model (src/probability_model/)
+- **Interface:** `ProbabilityModel.fit / predict / calibrate / predict_calibrated / predict_one`
+- **XGBoost:** `binary:logistic` trained on OHLCV features + strike encoding
+- **Calibration:** Isotonic regression on held-out calibration fold (last 2 weeks of training window)
+- **Strike encoding:**
+  - `log_moneyness = log(spot / X)` — symmetric, scale-invariant
+  - `vol_normalized_dist = log_moneyness / (σ_realized · √T)` — BSM d2 analog
+- **Walk-forward:** 6mo train / 2wk cal / 4wk val / 2wk step, ≥3 folds required
+- **Evaluation:** BSS per moneyness bucket (deep ITM → deep OTM), reliability diagram
+- **Retraining triggers:** calendar (every 7d) or BSS < 0 for 3 consecutive days
+- **Regime signal:** `vol_regime_ratio = vol_7d / vol_30d > 2.0` → `low_confidence` flag
 
 ### Lag Signal (src/lag_signal/)
 - Fetches BTC/ETH/XRP from Binance via ccxt
@@ -107,13 +162,43 @@ markets:
 7. **PnL tracking may be inaccurate** - PositionTracker doesn't persist between sessions; investigation needed
 
 ## TODOs (Priority Order)
-1. ~~**Add order sizing**~~ - ✅ DONE: Dynamic sizing based on price with min $1 value
-2. ~~**Implement position close**~~ - ✅ DONE: Uses `close_all_positions()` at market expiry
-3. **Add WebSocket support** - Real-time order book instead of polling
-4. ~~**Live testing**~~ - ✅ DONE: Tested with real orders on live markets
-5. **PNL snapshots** - Periodic snapshots not yet triggered in main loop
-6. ~~**Cleanup old managers**~~ - ✅ DONE: Cleared on market refresh
-7. **Investigate PnL tracking** - Position tracker may not track correctly across sessions
+
+### Probability Model — In-Progress (branch: `feature/probability-model`)
+1. **Backfill historical data** — Run `polybot backfill --symbol BTC/USDT --start-date 2024-01-01 --end-date 2024-12-31 --timeframe 1h` to populate `CryptoPrice` table before training
+2. **First walk-forward train** — Run `polybot train` and verify ≥3 folds, BSS > 0 in ATM bucket, reliability diagram within ±5% of perfect calibration
+3. **Real strike prices** — Current trainer uses `current_close` as a synthetic strike proxy. Replace with actual Polymarket strike prices stored alongside fills/positions in the DB. See `src/persistence/models.py` — add `strike_price` field to `Fill` or a separate `MarketMetadata` table
+4. **Alpha signal verification** — Confirm `model_implied_prob` vs `market_implied_prob` spread appears in `EventLog` during dry-run; check that spread diverges on ≥20% of ticks
+5. **Latency validation** — Add timing log around `estimate_fair_value()` in dry-run; verify p99 < 50ms
+6. **Transformer model (Phase 7)** — Implement `src/probability_model/transformer_model.py`:
+   - Same `ProbabilityModel` interface
+   - Input: rolling sequence of OHLCV feature vectors (not flat)
+   - Calibration: temperature scaling instead of isotonic regression
+   - Compare BSS vs XGBoost on same walk-forward folds; only ship if meaningfully better
+7. **Merge to main** — After dry-run validation passes success criteria (BSS > 0, latency < 50ms, ≥20% tick divergence), merge `feature/probability-model` → `main`
+
+### Viability Checks Before Merging
+- [ ] Walk-forward BSS > 0 in ≥3 folds across ≥2 moneyness buckets
+- [ ] Reliability diagram within ±5% in ATM bucket
+- [ ] `model_implied_prob` diverges from Polymarket price on ≥20% of dry-run ticks
+- [ ] `estimate_fair_value()` p99 latency < 50ms in dry-run
+- [ ] `CryptoPrice` table populated with ≥6 months of 1h OHLCV data
+- [ ] No new test failures vs baseline (currently 3 pre-existing failures)
+- [ ] `EventLog` shows `REGIME_CHANGE_DETECTED` and `MODEL_RETRAINED` events after a simulated BSS drop
+
+### Bot Infrastructure
+8. ~~**Add order sizing**~~ - ✅ DONE
+9. ~~**Implement position close**~~ - ✅ DONE
+10. **Add WebSocket support** - Real-time order book instead of polling
+11. ~~**Live testing**~~ - ✅ DONE
+12. **PNL snapshots** - Periodic snapshots not yet triggered in main loop
+13. ~~**Cleanup old managers**~~ - ✅ DONE
+14. **Investigate PnL tracking** - PositionTracker doesn't persist between sessions
+
+### Data & Model Quality
+15. **OHLCV schema gap** — `CryptoPrice` stores OHLCV in `metadata` JSON, not dedicated columns. Consider a migration adding `open`, `high`, `low`, `volume` columns for query performance once the model is validated
+16. **Gap exclusion in trainer** — `filter_candles_with_gaps()` in `gap_detector.py` exists but is not yet wired into `WalkForwardTrainer._build_dataset()`. Wire it in before production training
+17. **Annualization factor** — `features.py` assumes 1h candles (8760 periods/year). Add config param or auto-detect from candle spacing
+18. **Funding rates / order book depth** — Evaluate as separate feature experiments with before/after BSS comparison; only add if BSS improves
 
 ## Test Coverage
 **Completed:**
@@ -124,11 +209,23 @@ markets:
 - `tests/unit/test_position_sizing.py` - InventoryManager, RiskManager sizing ✓
 - `tests/unit/test_order_placement.py` - OrderManager, validation, lifecycle ✓
 - `tests/integration/test_order_integration.py` - Live CLOB API diagnostics ✓
+- `tests/unit/test_features.py` - OHLCV features, strike encoding ✓ (NEW)
+- `tests/unit/test_calibrator.py` - IsotonicCalibrator fit/transform/save/load ✓ (NEW)
+- `tests/unit/test_xgboost_model.py` - XGBoostModel fit/calibrate/predict/save/load ✓ (NEW)
+- `tests/unit/test_evaluator.py` - BSS, Brier, log loss, reliability diagram ✓ (NEW)
+- `tests/unit/test_gap_detector.py` - Gap detection edge cases ✓ (NEW)
+
+**Pre-existing failures (not caused by ML work):**
+- `tests/integration/test_order_integration.py::test_order_signature_generation` — requires live API keys
+- `tests/unit/test_avellaneda_stoikov.py::test_optimal_spread_increases_with_time` — pre-existing edge case
+- `tests/unit/test_logit.py::test_sigmoid_extreme_positive` — float precision edge case
 
 **Missing:**
 - Integration tests for persistence (Database, Repository)
-- End-to-end dry run test
+- End-to-end dry run test with ML model active
 - Market discovery tests
+- Walk-forward trainer integration test (needs real or synthetic candle DB)
+- `ModelAdapter` integration test (live=True path with a saved model)
 
 ## API References
 - **Polymarket CLOB**: `https://clob.polymarket.com`
@@ -146,6 +243,55 @@ POLYBOT_API_PASSPHRASE=<optional>
 ```
 
 ## Recent Changes
+
+### ML Probability Model — Phases 1–6 (branch: `feature/probability-model`)
+All work lives in `.worktrees/probability-model/`. Branch is `feature/probability-model`, **not yet merged to `main`**.
+
+**Data Pipeline (`src/data_pipeline/`)**
+- `binance_fetcher.py`: async CCXT OHLCV backfill + incremental fetch. Stores candles in `CryptoPrice` table with OHLC in `metadata` JSON field
+- `gap_detector.py`: detects gaps > 2× interval, writes to `EventLog` with severity WARNING, provides `filter_candles_with_gaps()` for training exclusion
+
+**Feature Engineering (`src/probability_model/features.py`)**
+- Log returns: 1/5/15/30/60-period
+- Realized vol: 5/15/60-period rolling std (annualized, assumes 1h candles)
+- Volume ratio, RSI-14, MACD signal + histogram, HL range fraction
+- `vol_regime_ratio = vol_7d / vol_30d` for confidence flagging
+- Strike features: `log_moneyness`, `vol_normalized_dist`, `time_remaining`
+
+**Model Interface & XGBoost (`src/probability_model/`)**
+- `base.py`: abstract `ProbabilityModel` with full interface
+- `calibrator.py`: `IsotonicCalibrator` (sklearn) with save/load
+- `xgboost_model.py`: `binary:logistic`, isotonic calibration, pickle serialization
+- `model_adapter.py`: `ModelAdapter(live=True/False)` — live calls real model, `live=False` returns `fixed_prob` for dry-run/testing
+
+**Training & Evaluation**
+- `trainer.py`: `WalkForwardTrainer` — 6mo/2wk/4wk/2wk schedule, regime coverage warning, synthetic strike proxy (replace with real strikes later)
+- `evaluator.py`: BSS, Brier, log loss per moneyness bucket, reliability diagram data, rich table output
+
+**Integration**
+- `belief.py`: added `estimate_fair_value()` — calls ML model, falls back to rolling-window mid, logs latency
+- `runner.py`: `ModelAdapter` initialized at startup, `_check_retrain_schedule()` checks calendar + BSS performance triggers, `_background_retrain()` runs non-blocking via `asyncio.create_task`
+- `config.py` + `config.example.yaml`: 6 new `belief:` keys with defaults (`model_type`, `model_path`, `retrain_interval_days`, `bss_retrain_threshold`, `bss_window_days`, `vol_regime_ratio_threshold`)
+- CLI: `polybot backfill` and `polybot train` commands added
+
+**Config additions under `belief:`**
+```yaml
+belief:
+  model_type: "xgboost"
+  model_path: "models/btc_prob_model.pkl"
+  retrain_interval_days: 7
+  bss_retrain_threshold: 0.0
+  bss_window_days: 14
+  vol_regime_ratio_threshold: 2.0
+```
+
+**Known gaps / not yet wired:**
+- `filter_candles_with_gaps()` exists but not called inside `WalkForwardTrainer._build_dataset()` — wire before production training
+- Strike prices in trainer are synthetic (`current_close` proxy); real Polymarket strikes needed
+- Alpha signal logging (`model_implied_prob` vs `market_implied_prob` spread) not yet emitted per tick
+- `transformer_model.py` is a stub — Phase 7 not started
+
+---
 
 ### Position Close at Expiry (Latest)
 - **Implemented automatic position closing** when `time_to_expiry` stop triggers:

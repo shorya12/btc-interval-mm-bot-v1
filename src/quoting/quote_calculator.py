@@ -149,32 +149,15 @@ class QuoteCalculator:
 
     def _compute_effective_gamma(self, context: QuoteContext) -> float:
         """
-        Compute effective gamma, increasing it in danger zones.
+        Compute effective gamma.
 
-        Near probability 0 or 1, we want to be more conservative
-        (higher gamma = wider spreads, faster inventory reduction).
+        NOTE: Danger zone adjustment is handled by RiskManager via gamma_multiplier
+        in the QuoteContext. We just return base_gamma here to avoid double-adjustment.
+
+        The final gamma = base_gamma * context.gamma_multiplier (applied in calculate())
         """
-        mid_prob = context.belief.mid_prob
-
-        # Distance from extreme
-        distance_from_extreme = min(mid_prob, 1 - mid_prob)
-
-        if distance_from_extreme < self.gamma_danger_threshold:
-            # In danger zone - increase gamma
-            # Linear interpolation: at threshold, gamma = base
-            # At extreme (0 or 1), gamma = base * multiplier
-            danger_ratio = 1 - (distance_from_extreme / self.gamma_danger_threshold)
-            gamma_increase = (self.gamma_danger_multiplier - 1) * danger_ratio
-            effective_gamma = self.base_gamma * (1 + gamma_increase)
-
-            logger.debug(
-                "gamma_adjusted_danger_zone",
-                mid_prob=round(mid_prob, 4),
-                base_gamma=self.base_gamma,
-                effective_gamma=round(effective_gamma, 4),
-            )
-            return min(effective_gamma, 1.0)  # Cap at 1.0
-
+        # Don't apply danger zone adjustment here - RiskManager handles it
+        # via context.gamma_multiplier to avoid double-adjustment
         return self.base_gamma
 
     def calculate_two_sided(

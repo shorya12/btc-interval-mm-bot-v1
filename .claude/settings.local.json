@@ -11,7 +11,9 @@
       "Bash(pip show:*)",
       "Bash(ls:*)",
       "Bash(python -m pytest:*)",
-      "Bash(source:*)"
+      "Bash(source:*)",
+      "Bash(pkill:*)",
+      "Bash(polybot run:*)"
     ]
   }
 }

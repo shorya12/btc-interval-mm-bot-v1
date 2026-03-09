@@ -624,7 +624,7 @@ def backtest(
         import pandas as pd
         from src.probability_model.xgboost_model import XGBoostModel
         from src.probability_model.trainer import WalkForwardTrainer
-        from scripts.backtest_flat_bets import simulate_flat_bets, print_fold_summary, print_threshold_summary
+        from scripts.backtest_flat_bets import simulate_flat_bets, print_fold_summary, print_threshold_summary, run_significance_tests, plot_cumulative_pnl
 
         db = Database(cfg.database.path)
         await db.connect()
@@ -683,6 +683,16 @@ def backtest(
             )
             print_threshold_summary(threshold_results, starting_balance)
 
+            # Significance tests + chart
+            console.print()
+            sig_results = run_significance_tests(all_preds, threshold_results, starting_balance)
+            import json as _json2, os as _os2
+            _os2.makedirs("models", exist_ok=True)
+            with open("models/significance_tests.json", "w") as _f2:
+                _json2.dump(sig_results, _f2, indent=2)
+            console.print("[dim]Saved to models/significance_tests.json[/dim]")
+            plot_cumulative_pnl(threshold_results, starting_balance)
+
             # Save backtest summary JSON for `polybot summary` command
             import json as _json
             import os as _os
@@ -708,6 +718,7 @@ def backtest(
                         "total_return_pct": round(s["total_return_pct"], 2),
                         "max_drawdown": round(s["max_drawdown"], 4),
                         "sharpe": round(s["sharpe"], 4),
+                        "total_fees": round(s.get("total_fees", 0.0), 2),
                     }
                     for t, s in threshold_results.items()
                 },

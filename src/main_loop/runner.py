@@ -131,6 +131,11 @@ class TradingLoop:
         self._candles_cache_tick: int = 0
         self._candles_cache_interval: int = 3600  # refresh every ~1h of ticks
 
+        # ML directional strategy state
+        # Tracks whether an entry order has been placed for each market in the current cycle.
+        # Reset on market refresh (new market discovered). Prevents duplicate entries.
+        self._ml_entry_placed: dict[str, bool] = {}
+
     async def start(self) -> None:
         """Initialize all components and start trading."""
         logger.info("trading_loop_starting", dry_run=self.dry_run)
@@ -257,10 +262,11 @@ class TradingLoop:
             gamma_danger_multiplier=self.config.risk.gamma_danger.gamma_multiplier,
         )
 
-        # Initialize ML probability model adapter
+        # Initialize ML probability model adapter.
+        # Always live=True: dry_run controls the exchange adapter, not the ML model.
         belief_cfg = self.config.belief
         self.model_adapter = ModelAdapter(
-            live=not self.dry_run,
+            live=True,
             model_path=belief_cfg.model_path,
             model_type=belief_cfg.model_type,
             fixed_prob=0.5,
@@ -383,9 +389,12 @@ class TradingLoop:
         
         # Clear invalid orderbook counts on refresh
         self._invalid_orderbook_counts.clear()
-        
+
         # Clear market end dates for stale markets
         self._market_end_dates.clear()
+
+        # Reset ML entry flags for new market cycle
+        self._ml_entry_placed.clear()
         
         # Clear tracked orders on market refresh (they'll be stale)
         if self.position_tracker:
@@ -1291,7 +1300,9 @@ class TradingLoop:
                 signal_skew = skew_signal.total_skew
 
             # 4b. Model probability signal
-            direction_threshold = getattr(self.config.belief, "direction_threshold", 0.10)
+            model_prob: float | None = None
+            model_confidence: str = "low"
+            direction_threshold = self.config.belief.direction_threshold
             if (
                 self.model_adapter is not None
                 and self.model_adapter.is_ready
@@ -1309,18 +1320,13 @@ class TradingLoop:
                     )
                     model_prob = belief_result.get("probability", snapshot.mid_price)
                     model_confidence = belief_result.get("confidence", "low")
-                    prob_delta = model_prob - snapshot.mid_price
-
                     logger.debug(
                         "model_signal",
                         model_prob=round(model_prob, 4),
                         market_mid=round(snapshot.mid_price, 4),
-                        delta=round(prob_delta, 4),
+                        delta=round(model_prob - snapshot.mid_price, 4),
                         confidence=model_confidence,
                     )
-
-                    if abs(prob_delta) > direction_threshold and model_confidence != "low":
-                        signal_skew += prob_delta
                 except Exception as exc:
                     logger.debug("model_signal_error", error=str(exc))
 
@@ -1379,201 +1385,154 @@ class TradingLoop:
                 
                 return result
 
-            # 6. Calculate quotes
-            context = QuoteContext(
-                belief=belief,
-                inventory=position_size,
-                time_remaining=1.0,  # Simplified: always 1.0
-                signal_skew=signal_skew,
-                gamma_multiplier=risk_decision.gamma_multiplier,
-            )
+            # 6. ML directional order decision
+            #
+            # Strategy:
+            #   YES market: buy when model_prob > 0.5 + threshold  (model says BTC goes UP)
+            #   NO  market: buy when model_prob < 0.5 - threshold  (model says BTC goes DOWN)
+            #   Exit (either market): model conviction has reversed since entry
+            #
+            ml_bet_fraction = self.config.belief.ml_bet_fraction
+            market_cfg = next((m for m in self.active_markets if m.token_id == token_id), None)
+            is_yes_market = (market_cfg.outcome.upper() == "YES") if market_cfg else True
 
-            quote_decision = self.quote_calculator.calculate_two_sided(
-                context=context,
-                allow_buy=risk_decision.allow_buy,
-                allow_sell=risk_decision.allow_sell,
-            )
+            # Directional edge — positive means model favours holding this outcome.
+            # No confidence gate here: the threshold filter (0.05) matches backtest conditions.
+            # vol_regime confidence is logged but does not suppress entries.
+            if model_prob is not None:
+                edge = (model_prob - 0.5) if is_yes_market else (0.5 - model_prob)
+            else:
+                edge = 0.0
 
-            if not quote_decision.should_quote or quote_decision.quote is None:
-                return result
+            wants_entry = edge > direction_threshold
+            wants_exit = edge < -direction_threshold  # conviction has flipped
 
-            quote = quote_decision.quote
+            # Mark entry as complete once position is filled
+            if position_size > 0:
+                self._ml_entry_placed[token_id] = True
 
-            # 7. Cancel stale orders and place new quotes
-            # Calculate order size: ensure minimum $1 value, then apply risk limits
-            min_order_value = 1.0  # Polymarket minimum order value
-            base_order_value = 5.0  # Target order value in USD
-            
-            # Calculate sizes based on price (ensuring minimum value)
-            bid_size = self._calculate_order_size(
-                price=quote.bid_price,
-                min_value=min_order_value,
-                target_value=base_order_value,
-                side="BUY",
-                position_size=position_size,
-                bankroll=bankroll,
-            )
-            ask_size = self._calculate_order_size(
-                price=quote.ask_price,
-                min_value=min_order_value,
-                target_value=base_order_value,
-                side="SELL",
-                position_size=position_size,
-                bankroll=bankroll,
-            )
-            
-            if self.dry_run and isinstance(self.client, DryRunAdapter):
-                # Cancel existing orders
-                result.orders_cancelled = await self.client.cancel_all_orders(token_id)
-
-                # Place new orders
-                if risk_decision.allow_buy and bid_size > 0:
-                    await self.client.place_limit_order(
-                        token_id=token_id,
-                        side=OrderSide.BUY,
-                        price=quote.bid_price,
-                        size=bid_size,
-                    )
-                    result.bid_placed = True
-
-                if risk_decision.allow_sell and ask_size > 0:
-                    await self.client.place_limit_order(
-                        token_id=token_id,
-                        side=OrderSide.SELL,
-                        price=quote.ask_price,
-                        size=ask_size,
-                    )
-                    result.ask_placed = True
-
-            elif isinstance(self.client, PolymarketClient):
-                order_manager = self.order_managers.get(token_id)
-                if order_manager:
-                    # Cancel stale orders
-                    stale = order_manager.get_stale_orders()
-                    for order in stale:
-                        await order_manager.cancel_order(order.id)
-                        result.orders_cancelled += 1
-                        # Track cancellation
-                        if self.position_tracker:
-                            self.position_tracker.record_order_cancelled(order.id, token_id)
-
-                    # Apply position tracker limits for live mode
-                    if self.position_tracker:
-                        # Get allowed sizes based on exposure limits
-                        bid_size = self.position_tracker.get_allowed_order_size(
-                            token_id=token_id,
-                            side="BUY",
-                            price=quote.bid_price,
-                            desired_size=bid_size,
-                        )
-                        ask_size = self.position_tracker.get_allowed_order_size(
-                            token_id=token_id,
-                            side="SELL",
-                            price=quote.ask_price,
-                            desired_size=ask_size,
-                        )
-                        
-                        # Enforce Polymarket minimums after position tracker limits
-                        # If exposure limits reduce size below minimums, skip the order
-                        if bid_size > 0 and bid_size < self.MIN_ORDER_SHARES:
-                            logger.debug(
-                                "bid_size_below_minimum_shares",
-                                bid_size=bid_size,
-                                min_shares=self.MIN_ORDER_SHARES,
-                            )
-                            bid_size = 0
-                        if bid_size > 0 and bid_size * quote.bid_price < self.MIN_ORDER_VALUE:
-                            logger.debug(
-                                "bid_value_below_minimum",
-                                bid_size=bid_size,
-                                bid_price=quote.bid_price,
-                                value=bid_size * quote.bid_price,
-                            )
-                            bid_size = 0
-                        
-                        if ask_size > 0 and ask_size < self.MIN_ORDER_SHARES:
-                            logger.debug(
-                                "ask_size_below_minimum_shares",
-                                ask_size=ask_size,
-                                min_shares=self.MIN_ORDER_SHARES,
-                            )
-                            ask_size = 0
-                        if ask_size > 0 and ask_size * quote.ask_price < self.MIN_ORDER_VALUE:
-                            logger.debug(
-                                "ask_value_below_minimum",
-                                ask_size=ask_size,
-                                ask_price=quote.ask_price,
-                                value=ask_size * quote.ask_price,
-                            )
-                            ask_size = 0
-                        
-                        # Log exposure status periodically
-                        exposure = self.position_tracker.get_exposure_summary()
-                        if exposure.at_max_exposure:
-                            logger.info(
-                                "at_max_exposure",
-                                token_id=token_id[:16] + "...",
-                                total_exposure=round(exposure.total_exposure, 2),
-                                exposure_pct=round(exposure.exposure_pct * 100, 1),
-                            )
-
-                    # Place new quotes
-                    # Only place BUY orders (we can always buy with USDC)
-                    if risk_decision.allow_buy and bid_size > 0:
-                        order = await order_manager.place_order(
-                            token_id=token_id,
-                            side=OrderSide.BUY,
-                            price=quote.bid_price,
-                            size=bid_size,
-                        )
-                        result.bid_placed = True
-                        # Track the order
-                        if self.position_tracker and order:
-                            self.position_tracker.record_order_placed(
-                                order_id=order.id,
-                                token_id=token_id,
-                                side="BUY",
-                                price=quote.bid_price,
-                                size=bid_size,
-                            )
-
-                    # Only place SELL orders if we have tokens to sell
-                    # In live mode, only sell if we have a positive position
-                    can_sell = position_size > 0
-                    if risk_decision.allow_sell and ask_size > 0 and can_sell:
-                        # Limit sell size to what we actually have
-                        sell_size = min(ask_size, position_size)
-                        if sell_size > 0:
-                            order = await order_manager.place_order(
+            # --- EXIT: reverse signal while holding a position ---
+            if position_size > 0 and wants_exit:
+                exit_price = snapshot.best_bid
+                if exit_price and 0 < exit_price < 1:
+                    exit_size = round(position_size, 2)
+                    can_exit = exit_size >= self.MIN_ORDER_SHARES and exit_size * exit_price >= self.MIN_ORDER_VALUE
+                    if can_exit:
+                        if self.dry_run and isinstance(self.client, DryRunAdapter):
+                            await self.client.cancel_all_orders(token_id)
+                            order = await self.client.place_limit_order(
                                 token_id=token_id,
                                 side=OrderSide.SELL,
-                                price=quote.ask_price,
-                                size=sell_size,
+                                price=exit_price,
+                                size=exit_size,
                             )
-                            result.ask_placed = True
-                            # Track the order
-                            if self.position_tracker and order:
-                                self.position_tracker.record_order_placed(
-                                    order_id=order.id,
+                            if order:
+                                result.ask_placed = True
+                                self._ml_entry_placed[token_id] = False
+                        elif isinstance(self.client, PolymarketClient):
+                            order_manager = self.order_managers.get(token_id)
+                            if order_manager:
+                                for o in order_manager.get_stale_orders():
+                                    await order_manager.cancel_order(o.id)
+                                    result.orders_cancelled += 1
+                                order = await order_manager.place_order(
                                     token_id=token_id,
-                                    side="SELL",
-                                    price=quote.ask_price,
-                                    size=sell_size,
+                                    side=OrderSide.SELL,
+                                    price=exit_price,
+                                    size=exit_size,
                                 )
-                    elif risk_decision.allow_sell and not can_sell:
-                        logger.debug(
-                            "sell_skipped_no_position",
+                                if order:
+                                    result.ask_placed = True
+                                    self._ml_entry_placed[token_id] = False
+                                    if self.position_tracker:
+                                        self.position_tracker.record_order_placed(
+                                            order.id, token_id, "SELL", exit_price, exit_size
+                                        )
+                        logger.info(
+                            "ML_EXIT",
                             token_id=token_id[:16] + "...",
-                            position_size=position_size,
+                            outcome="YES" if is_yes_market else "NO",
+                            edge=round(edge, 4),
+                            position=round(position_size, 2),
+                            price=round(exit_price, 4),
                         )
+
+            # --- ENTRY: signal fired, no position yet, haven't entered this cycle ---
+            elif (
+                position_size == 0
+                and not self._ml_entry_placed.get(token_id, False)
+                and wants_entry
+                and risk_decision.allow_buy
+            ):
+                entry_price = snapshot.best_ask
+                if entry_price and 0 < entry_price < 1:
+                    bet_value = bankroll * ml_bet_fraction
+                    buy_size = max(bet_value / entry_price, self.MIN_ORDER_SHARES)
+                    buy_size = round(buy_size, 2)
+                    can_enter = buy_size >= self.MIN_ORDER_SHARES and buy_size * entry_price >= self.MIN_ORDER_VALUE
+                    if can_enter:
+                        if self.dry_run and isinstance(self.client, DryRunAdapter):
+                            order = await self.client.place_limit_order(
+                                token_id=token_id,
+                                side=OrderSide.BUY,
+                                price=entry_price,
+                                size=buy_size,
+                            )
+                            if order:
+                                result.bid_placed = True
+                                self._ml_entry_placed[token_id] = True
+                        elif isinstance(self.client, PolymarketClient):
+                            order_manager = self.order_managers.get(token_id)
+                            if order_manager:
+                                if self.position_tracker:
+                                    buy_size = self.position_tracker.get_allowed_order_size(
+                                        token_id=token_id,
+                                        side="BUY",
+                                        price=entry_price,
+                                        desired_size=buy_size,
+                                    )
+                                if buy_size >= self.MIN_ORDER_SHARES and buy_size * entry_price >= self.MIN_ORDER_VALUE:
+                                    order = await order_manager.place_order(
+                                        token_id=token_id,
+                                        side=OrderSide.BUY,
+                                        price=entry_price,
+                                        size=buy_size,
+                                    )
+                                    if order:
+                                        result.bid_placed = True
+                                        self._ml_entry_placed[token_id] = True
+                                        if self.position_tracker:
+                                            self.position_tracker.record_order_placed(
+                                                order.id, token_id, "BUY", entry_price, buy_size
+                                            )
+                        logger.info(
+                            "ML_ENTRY",
+                            token_id=token_id[:16] + "...",
+                            outcome="YES" if is_yes_market else "NO",
+                            model_prob=round(model_prob, 4) if model_prob is not None else None,
+                            edge=round(edge, 4),
+                            price=round(entry_price, 4),
+                            size=round(buy_size, 2),
+                            bet_value=round(buy_size * entry_price, 2),
+                        )
+
+            # --- HOLD: in position with active signal, or no signal ---
+            else:
+                logger.debug(
+                    "ml_hold",
+                    edge=round(edge, 4),
+                    threshold=direction_threshold,
+                    has_position=position_size > 0,
+                    entry_placed=self._ml_entry_placed.get(token_id, False),
+                )
 
             logger.debug(
                 "tick_complete",
                 tick=self._tick_count,
-                mid=round(belief.mid_prob, 4) if belief else None,
-                bid=round(quote.bid_price, 4),
-                ask=round(quote.ask_price, 4),
-                spread_bps=round(quote.spread_bps, 1),
+                mid=round(snapshot.mid_price, 4) if snapshot.mid_price else None,
+                model_prob=round(model_prob, 4) if model_prob is not None else None,
+                edge=round(edge, 4),
+                position=round(position_size, 2),
             )
 
         except Exception as e:

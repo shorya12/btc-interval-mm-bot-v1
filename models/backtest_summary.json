@@ -1,0 +1,50 @@
+{
+  "run_date": "2026-03-09T19:30:02.932318",
+  "n_folds": 18,
+  "val_start": "2024-07-01 20:00:00",
+  "val_end": "2025-03-24 19:00:00",
+  "n_predictions": 6339,
+  "profitable_folds": 14,
+  "thresholds": {
+    "0.0": {
+      "n_bets": 6036,
+      "win_rate": 0.5086,
+      "profit_factor": 1.0351,
+      "final_balance": 11629.586115625776,
+      "total_return_pct": 16.3,
+      "max_drawdown": 0.4719,
+      "sharpe": 0.2527,
+      "total_fees": 8770.41
+    },
+    "0.05": {
+      "n_bets": 2295,
+      "win_rate": 0.5155,
+      "profit_factor": 1.0638,
+      "final_balance": 14140.734429012313,
+      "total_return_pct": 41.41,
+      "max_drawdown": 0.2281,
+      "sharpe": 1.6896,
+      "total_fees": 2959.27
+    },
+    "0.1": {
+      "n_bets": 1187,
+      "win_rate": 0.5156,
+      "profit_factor": 1.0643,
+      "final_balance": 12408.339986467327,
+      "total_return_pct": 24.08,
+      "max_drawdown": 0.206,
+      "sharpe": 1.9001,
+      "total_fees": 1291.66
+    },
+    "0.15": {
+      "n_bets": 571,
+      "win_rate": 0.5201,
+      "profit_factor": 1.0839,
+      "final_balance": 11863.320714547219,
+      "total_return_pct": 18.63,
+      "max_drawdown": 0.1874,
+      "sharpe": 3.0578,
+      "total_fees": 436.68
+    }
+  }
+}

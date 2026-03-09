@@ -29,6 +29,7 @@ dependencies = [
     "rich>=13.0.0",
     "structlog>=23.2.0",
     "python-dotenv>=1.0.0",
+    "matplotlib>=3.7.0",
 ]
 
 [project.optional-dependencies]

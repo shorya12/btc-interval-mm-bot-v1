@@ -160,93 +160,84 @@ class DryRunAdapter:
 
     def _calculate_fill_probability(self, order: Order, book: OrderBook | None) -> float:
         """
-        Calculate realistic fill probability based on order book depth.
-        
-        Factors:
-        - Size relative to available liquidity (smaller orders fill easier)
-        - Distance from mid price (aggressive orders fill easier)
-        - Spread width (tighter spreads = more activity = higher fill rate)
-        
+        Calculate realistic fill probability for MARKET-MAKING orders.
+
+        Market makers PROVIDE liquidity with passive limit orders.
+        Fill probability depends on how attractive our quote is:
+        - If our BUY price > best bid, we're at top of queue = HIGH fill prob
+        - If our SELL price < best ask, we're at top of queue = HIGH fill prob
+        - Orders that IMPROVE the spread get filled by incoming market orders
+
         Args:
             order: The order to evaluate
             book: Current order book (if available)
-            
+
         Returns:
             Fill probability between 0 and 1
         """
         if not self.realistic_fills or book is None:
             return self.base_fill_rate
-        
-        # Get relevant book side
-        if order.side == OrderSide.BUY:
-            levels = book.asks  # We're buying, so look at asks
-            best_price = book.best_ask_price
-        else:
-            levels = book.bids  # We're selling, so look at bids
-            best_price = book.best_bid_price
-        
-        if not levels or best_price is None:
-            return self.base_fill_rate * 0.5  # Low probability if no book
-        
+
+        best_bid = book.best_bid_price
+        best_ask = book.best_ask_price
         mid_price = book.mid_price or 0.5
-        
-        # Factor 1: Size relative to book depth
-        # Sum up available liquidity at or better than our price
-        available_liquidity = 0.0
-        for level in levels:
-            if order.side == OrderSide.BUY:
-                if level.price <= order.price:
-                    available_liquidity += level.size
-            else:
-                if level.price >= order.price:
-                    available_liquidity += level.size
-        
-        if available_liquidity <= 0:
-            size_factor = 0.1  # Very unlikely to fill if no liquidity
-        else:
-            # Probability decreases as order size increases relative to liquidity
-            # P = 1 - (size / (size + liquidity))
-            size_factor = available_liquidity / (order.size + available_liquidity)
-        
-        # Factor 2: Price aggressiveness
-        # How far is our order from the best available price?
+        spread = book.spread or 0.02
+
+        if best_bid is None or best_ask is None:
+            return self.base_fill_rate * 0.5
+
+        # For market makers, check if our order IMPROVES the current spread
+        # Better prices = higher chance of getting hit by incoming market orders
         if order.side == OrderSide.BUY:
-            # For buys, higher price = more aggressive
-            price_diff = order.price - best_price
+            # BUY order: compare to best bid
+            # If our bid > best_bid, we're improving the market = high fill prob
+            price_improvement = order.price - best_bid
+            # Also check if we're crossing the spread (bid >= ask = immediate fill)
+            if order.price >= best_ask:
+                return 0.95  # Crossing spread = almost certain fill
         else:
-            # For sells, lower price = more aggressive
-            price_diff = best_price - order.price
-        
-        # Normalize by spread (if spread is 1%, a 0.5% improvement is aggressive)
-        spread = book.spread or 0.01
-        aggressiveness = price_diff / spread if spread > 0 else 0
-        
-        # Convert to probability factor: aggressive orders (positive) get boost
-        # Passive orders (negative) get penalty
-        price_factor = min(1.0, max(0.1, 0.5 + aggressiveness * 0.3))
-        
-        # Factor 3: Market activity proxy (spread width)
-        # Tighter spreads typically mean more activity
-        spread_bps = (spread / mid_price) * 10000 if mid_price > 0 else 100
-        if spread_bps < 50:  # Very tight spread
-            activity_factor = 1.0
-        elif spread_bps < 100:  # Normal spread
-            activity_factor = 0.8
-        elif spread_bps < 200:  # Wide spread
-            activity_factor = 0.5
-        else:  # Very wide spread
-            activity_factor = 0.3
-        
-        # Combine factors with base rate
-        fill_prob = self.base_fill_rate * size_factor * price_factor * activity_factor
-        
-        # Add a small baseline for passive orders being swept by market orders
-        # This simulates aggressive traders hitting our quotes
-        min_passive_fill_prob = 0.05  # 5% base chance even for passive orders
-        fill_prob = max(fill_prob, min_passive_fill_prob * self.base_fill_rate)
-        
+            # SELL order: compare to best ask
+            # If our ask < best_ask, we're improving the market = high fill prob
+            price_improvement = best_ask - order.price
+            # Also check if we're crossing the spread (ask <= bid = immediate fill)
+            if order.price <= best_bid:
+                return 0.95  # Crossing spread = almost certain fill
+
+        # Normalize improvement by spread width
+        # improvement_ratio > 0 means we're improving the spread
+        # improvement_ratio = 1.0 means we've moved to the mid price
+        improvement_ratio = price_improvement / (spread / 2) if spread > 0 else 0
+
+        # Calculate fill probability based on how much we improve the spread
+        if improvement_ratio >= 1.0:
+            # At or past mid price = very high fill probability
+            fill_prob = 0.7 + min(0.25, improvement_ratio * 0.1)
+        elif improvement_ratio > 0:
+            # Improving spread but not at mid = good fill probability
+            # Linear from 0.4 (at best bid/ask) to 0.7 (at mid)
+            fill_prob = 0.4 + improvement_ratio * 0.3
+        elif improvement_ratio > -0.5:
+            # Slightly behind best = moderate fill probability
+            fill_prob = 0.2 + (improvement_ratio + 0.5) * 0.4
+        else:
+            # Far from best = low fill probability
+            fill_prob = max(0.05, 0.2 + improvement_ratio * 0.2)
+
+        # Factor in order size (smaller orders fill easier)
+        # Use total book depth at our side for comparison
+        if order.side == OrderSide.BUY:
+            total_depth = sum(level.size for level in book.bids) if book.bids else 100
+        else:
+            total_depth = sum(level.size for level in book.asks) if book.asks else 100
+
+        size_ratio = order.size / max(total_depth, 1)
+        size_factor = 1.0 - min(0.5, size_ratio * 0.5)  # Small penalty for large orders
+
+        # Apply base fill rate as a scaling factor
+        fill_prob = fill_prob * self.base_fill_rate * 2 * size_factor  # 2x because base is 0.5
+
         # Clamp to reasonable range
-        return min(0.95, max(0.02, fill_prob))
+        return min(0.90, max(0.05, fill_prob))
 
     async def _try_fill_order(self, order: Order) -> Fill | None:
         """
